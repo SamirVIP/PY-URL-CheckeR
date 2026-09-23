@@ -9,7 +9,7 @@ What it does
                            ShadowRing
                            PowlerRing
      - linklist.txt   -> one URL per line, with a (Word) placeholder, e.g.
-                           https://dl.dir.freefiremobile.com/1750x1070_M1917(Word)_en.jpg
+                           https://dl.dir.freefiremobile.com/.../1750x1070_M1917(Word)_en.jpg
 
 2. The bot builds every combination of link x word (replacing "(Word)"
    with each word from wordlist.txt) and checks all of them FAST using
@@ -69,11 +69,11 @@ except ImportError:
 # CONFIG
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGkwwoRzvAz9Y3Zcan_JtLKxyeNEm8gS_M").strip()
 
 # Comma separated chat ids allowed to use the bot, e.g. "111111111,222222222"
 ALLOWED_CHAT_IDS = {
-    int(x.strip()) for x in os.environ.get("ALLOWED_CHAT_IDS", "").split(",") if x.strip()
+    int(x.strip()) for x in os.environ.get("ALLOWED_CHAT_IDS", "6206433961").split(",") if x.strip()
 }
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))

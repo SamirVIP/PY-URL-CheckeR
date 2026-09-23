@@ -70,22 +70,37 @@ or a systemd service so it keeps running in the background 24/7).
 |---|---|
 | `/start` | Welcome message |
 | `/help` | Full instructions |
-| `/check` | Check every link×word combination right now |
+| `/check` | Check every link×word combination right now, with **live progress** and instant alerts |
 | `/autocheck N` | Auto re-check every N minutes (1–10) |
-| `/stopautocheck` | Stop the automatic loop |
-| `/resetfound` | Forget which links were already reported, so they can be reported again |
-| `/status` | Show how many words/links are loaded, combo count, autocheck state |
+| `/stopautocheck` | Stop the automatic loop and its 30-minute status updates |
+| `/resetstats` | Clear the "working links seen" counter shown in `/status` |
+| `/status` | Show how many words/links are loaded, combo count, autocheck state, cycle stats |
 
-## Notes on speed
+## How checking & notifications work
 
-- Checks run concurrently (`MAX_CONCURRENT_REQUESTS`, default 200 at a
-  time), using a fast `HEAD` request first and only falling back to
-  `GET` if a server doesn't support `HEAD`.
+- **Every** working link (HTTP 200, and not an HTML "not found" page in
+  disguise) triggers an immediate message with the link + image — the
+  instant it's confirmed, not batched at the end.
+- `/check` shows a live progress message that updates every few seconds:
+  `Progress: 340/1000 — Working found so far: 2`.
+- `/autocheck N` re-checks the full combination list every N minutes,
+  and messages you **every time** it finds a working link — every
+  cycle, even if it already reported that same link before. (If a link
+  stays live across multiple cycles, you'll get repeated notifications
+  — that's intentional, so you never miss a "still working" confirmation.)
+- Separately, while autocheck is on, a **status update is sent every 30
+  minutes** — independent of your check interval — summarizing cycles
+  run, last check size, and total unique working links seen so far.
+
+## Notes on speed & reliability
+
+- Checks run concurrently (`MAX_CONCURRENT_REQUESTS`, default 150 at a
+  time) using real `GET` requests. Earlier versions used `HEAD` first,
+  which some CDNs answer inconsistently versus a real `GET` — that was
+  causing genuinely live links to be missed. `GET` is what actually
+  matters, so that's what's used to decide "working."
 - If a server starts blocking you for going too fast, lower
   `MAX_CONCURRENT_REQUESTS` in `.env`.
-- The bot avoids repeat-spamming: during automatic loop checks it only
-  messages you about links that are newly found (not ones it already
-  reported). Use `/resetfound` if you want it to re-announce everything.
 - Each chat's uploaded files are stored under `data/<chat_id>/`, so they
   survive a bot restart.
 

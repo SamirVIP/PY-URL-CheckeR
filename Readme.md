@@ -70,7 +70,8 @@ or a systemd service so it keeps running in the background 24/7).
 |---|---|
 | `/start` | Welcome message |
 | `/help` | Full instructions |
-| `/check` | Check every link×word combination right now, with **live progress** and instant alerts |
+| `/check` | Check every link×word combination right now, with **live progress** — guarantees every working link found gets sent to you |
+| `/cancel` | Stop a `/check` that's currently running (also works as `/cancle`) |
 | `/autocheck N` | Auto re-check every N minutes (1–10) |
 | `/stopautocheck` | Stop the automatic loop and its 30-minute status updates |
 | `/resetstats` | Clear the "working links seen" counter shown in `/status` |
@@ -79,10 +80,22 @@ or a systemd service so it keeps running in the background 24/7).
 ## How checking & notifications work
 
 - **Every** working link (HTTP 200, and not an HTML "not found" page in
-  disguise) triggers an immediate message with the link + image — the
-  instant it's confirmed, not batched at the end.
+  disguise) is queued the instant it's confirmed and sent by a single
+  dedicated sender — this guarantees every one gets delivered, even
+  when dozens are found in the same second, instead of firing them all
+  at once and risking some getting silently dropped by Telegram's rate
+  limits. If Telegram briefly rate-limits a send, it's retried
+  automatically rather than lost.
+- Notifications are sent as **plain text** (no Markdown formatting).
+  Earlier versions used Markdown, and Telegram treats a single
+  underscore (`_`) as an italics marker — a real filename like
+  `..._en.jpg` has an odd number of underscores, which made Telegram
+  reject the whole message and silently drop it. Plain text avoids that
+  entirely, for underscores or any other character that shows up in a link.
 - `/check` shows a live progress message that updates every few seconds:
-  `Progress: 340/1000 — Working found so far: 2`.
+  `Progress: 340/1000 — Working found so far: 2`, and can be stopped
+  any time with `/cancel` — anything already found up to that point
+  still gets sent before it stops.
 - `/autocheck N` re-checks the full combination list every N minutes,
   and messages you **every time** it finds a working link — every
   cycle, even if it already reported that same link before. (If a link

@@ -16,11 +16,14 @@ What it does
    asyncio + aiohttp with hundreds of requests running at once.
 
 3. The instant a link responds with HTTP 200 (i.e. it actually exists),
-   the bot immediately sends you a message with that link + the image —
-   it does not wait for the whole batch to finish first.
+   it's queued for notification and sent to you with the image — every
+   single working link, guaranteed, even if many are found at once
+   (sends are paced and retried so Telegram's rate limits never cause a
+   dropped notification).
 
 4. /check shows LIVE progress while it runs (checked so far / total,
-   how many working found so far), updating every few seconds.
+   how many working found so far), updating every few seconds. You can
+   cancel a running check any time with /cancel (or /cancle).
 
 5. /autocheck N re-checks everything automatically every N minutes
    (1-10). Every single time a working link is found, it messages you
@@ -36,6 +39,7 @@ Commands
 /start          - welcome message
 /help           - list of commands / how to use the bot
 /check          - check all link+word combinations right now, live progress
+/cancel         - cancel a /check that's currently running (alias: /cancle)
 /autocheck N    - start automatic re-checking every N minutes (1-10)
 /stopautocheck  - stop the automatic re-checking (and its 30-min status updates)
 /resetstats     - clear the "working links seen" stats used in /status
@@ -57,6 +61,7 @@ from datetime import datetime
 import aiohttp
 from telegram import Update
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TimedOut, NetworkError
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -99,6 +104,10 @@ REQUEST_TIMEOUT_SECONDS = float(os.environ.get("REQUEST_TIMEOUT_SECONDS", "10"))
 
 # How often (seconds) the /check progress message is refreshed.
 PROGRESS_UPDATE_SECONDS = 3.0
+
+# Small pause between outgoing Telegram notifications so a burst of
+# working links found at once doesn't trip Telegram's rate limits.
+NOTIFY_PACE_SECONDS = 0.10
 
 # Fixed heartbeat interval for autocheck status updates (30 minutes),
 # independent of whatever check interval the user picks.
@@ -149,6 +158,7 @@ def get_state(chat_id: int) -> dict:
             "last_run_time": None,
             "last_run_checked": 0,
             "last_run_working": 0,
+            "check_task": None,      # the currently running /check asyncio.Task, if any
         }
     return chat_state[chat_id]
 
@@ -214,6 +224,46 @@ async def check_one(session: aiohttp.ClientSession, url: str, sem: asyncio.Semap
             return False
 
 
+async def send_working_link(bot, chat_id: int, url: str, attempts: int = 4):
+    """Send a 'working link found' notification, guaranteed best-effort.
+
+    IMPORTANT: no Markdown/HTML parse_mode is used here. Telegram's
+    Markdown treats a single underscore as an italics marker — a real
+    URL like ..._en.jpg has an odd number of underscores, which used to
+    make Telegram reject the whole message ("can't parse entities") and
+    silently drop the notification. Plain text sidesteps that
+    completely, for underscores, asterisks, or anything else that
+    happens to appear in a link.
+    """
+    caption = f"✅ Working Link Found!\n{url}"
+    for attempt in range(1, attempts + 1):
+        try:
+            await bot.send_photo(chat_id=chat_id, photo=url, caption=caption)
+            return True
+        except RetryAfter as e:
+            wait_s = float(getattr(e, "retry_after", 2)) + 0.5
+            logger.info("Rate limited sending %s, waiting %.1fs (attempt %d)", url, wait_s, attempt)
+            await asyncio.sleep(wait_s)
+        except (TimedOut, NetworkError):
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            # Photo send failed for some other reason (e.g. Telegram couldn't
+            # fetch/parse it as an image) — fall back to a plain text message
+            # so the link itself is never lost.
+            logger.warning("send_photo failed for %s (%s); trying plain text.", url, e)
+            try:
+                await bot.send_message(chat_id=chat_id, text=caption)
+                return True
+            except RetryAfter as e2:
+                wait_s = float(getattr(e2, "retry_after", 2)) + 0.5
+                await asyncio.sleep(wait_s)
+            except Exception:
+                logger.exception("Text fallback also failed for %s (attempt %d)", url, attempt)
+                await asyncio.sleep(1.0)
+    logger.error("Giving up notifying about working link after %d attempts: %s", attempts, url)
+    return False
+
+
 async def perform_check(
     bot,
     chat_id: int,
@@ -221,9 +271,16 @@ async def perform_check(
     progress_message=None,
 ) -> list[str]:
     """
-    Check every url concurrently. The moment a url is confirmed working,
-    a message is sent immediately (not batched at the end). If
-    progress_message is given, it is live-edited with running totals.
+    Check every url concurrently. Every url confirmed working is pushed
+    onto a queue and sent by a single dedicated sender task — this
+    guarantees every working link gets a notification (with retries),
+    instead of firing many send_photo calls at once and letting some
+    get silently lost to Telegram's rate limits.
+
+    If progress_message is given, it is live-edited with running totals.
+    Supports cancellation: if this coroutine's task is cancelled, it
+    stops checking, drains and sends any already-found links, and marks
+    the progress message as cancelled.
 
     Returns the full list of urls that were found working in this run.
     """
@@ -231,18 +288,19 @@ async def perform_check(
     working: list[str] = []
     completed = 0
     lock = asyncio.Lock()
-    stop_event = asyncio.Event()
+    stop_progress = asyncio.Event()
+    notify_queue: asyncio.Queue = asyncio.Queue()
 
-    async def notify_found(url: str):
-        caption = f"✅ *Working Link Found!*\n{url}"
-        try:
-            await bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode=ParseMode.MARKDOWN)
-        except Exception as e:
-            logger.warning("Could not send photo for %s (%s); sending as text.", url, e)
+    async def sender_loop():
+        while True:
+            url = await notify_queue.get()
             try:
-                await bot.send_message(chat_id=chat_id, text=caption, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                logger.exception("Failed to notify about working link %s", url)
+                if url is None:  # sentinel -> stop
+                    return
+                await send_working_link(bot, chat_id, url)
+                await asyncio.sleep(NOTIFY_PACE_SECONDS)
+            finally:
+                notify_queue.task_done()
 
     async def worker(url: str, session: aiohttp.ClientSession):
         nonlocal completed
@@ -252,20 +310,21 @@ async def perform_check(
             if ok:
                 working.append(url)
         if ok:
-            await notify_found(url)
+            await notify_queue.put(url)
 
     async def progress_updater():
         last_text = None
-        while not stop_event.is_set():
+        while not stop_progress.is_set():
             try:
-                await asyncio.wait_for(stop_event.wait(), timeout=PROGRESS_UPDATE_SECONDS)
+                await asyncio.wait_for(stop_progress.wait(), timeout=PROGRESS_UPDATE_SECONDS)
             except asyncio.TimeoutError:
                 pass
             if progress_message is not None:
                 text = (
                     "🔎 *Checking links...*\n"
                     f"Progress: `{completed}/{total}`\n"
-                    f"Working found so far: `{len(working)}`"
+                    f"Working found so far: `{len(working)}`\n"
+                    "_Send /cancel to stop._"
                 )
                 if text != last_text:
                     try:
@@ -279,22 +338,48 @@ async def perform_check(
     timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
 
     progress_task = asyncio.create_task(progress_updater()) if progress_message is not None else None
+    sender_task = asyncio.create_task(sender_loop())
 
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        await asyncio.gather(*(worker(u, session) for u in urls))
+    cancelled = False
+    try:
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+            await asyncio.gather(*(worker(u, session) for u in urls))
+    except asyncio.CancelledError:
+        cancelled = True
+    finally:
+        # Whether we finished normally or were cancelled, make sure every
+        # link that WAS found working still gets sent before we return.
+        await notify_queue.join()
+        await notify_queue.put(None)
+        await sender_task
 
-    stop_event.set()
-    if progress_task is not None:
-        await progress_task
-        try:
-            final_text = (
-                "✅ *Check complete!*\n"
-                f"Checked: `{total}`\n"
-                f"Working found: `{len(working)}`"
-            )
-            await progress_message.edit_text(final_text, parse_mode=ParseMode.MARKDOWN)
-        except Exception:
-            pass
+        stop_progress.set()
+        if progress_task is not None:
+            try:
+                await asyncio.wait_for(progress_task, timeout=PROGRESS_UPDATE_SECONDS + 1)
+            except Exception:
+                progress_task.cancel()
+
+        if progress_message is not None:
+            try:
+                if cancelled:
+                    final_text = (
+                        "🛑 *Check cancelled.*\n"
+                        f"Checked: `{completed}/{total}`\n"
+                        f"Working found: `{len(working)}`"
+                    )
+                else:
+                    final_text = (
+                        "✅ *Check complete!*\n"
+                        f"Checked: `{total}`\n"
+                        f"Working found: `{len(working)}`"
+                    )
+                await progress_message.edit_text(final_text, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                pass
+
+    if cancelled:
+        raise asyncio.CancelledError()
 
     return working
 
@@ -316,7 +401,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "2️⃣ Send me `linklist.txt` — one URL per line, with `(Word)` "
         "where the word should go.\n"
         "3️⃣ Send /check — I'll test every combination at once and show "
-        "you *live progress* as it runs.\n"
+        "you *live progress* as it runs (you can /cancel any time).\n"
         "4️⃣ Optionally, send /autocheck 5 and I'll keep checking every "
         "5 minutes forever, messaging you the moment anything is live "
         "(plus a status update every 30 minutes).\n\n"
@@ -340,7 +425,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/start — welcome message\n"
         "/help — this message\n"
         "/check — check every link×word combination right now, with "
-        "live progress, and instant alerts as working links are found\n"
+        "live progress, and every working link found gets sent to you\n"
+        "/cancel — stop a /check that's currently running\n"
         "/autocheck `N` — auto re-check every N minutes (1–10). Sends a "
         "message *every time* a working link is found (every cycle), "
         "plus a status update every 30 minutes\n"
@@ -365,12 +451,14 @@ async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if state["last_run_time"]
         else "never"
     )
+    check_running = state["check_task"] is not None and not state["check_task"].done()
 
     text = (
         "*📊 Status*\n"
         f"Words loaded: `{len(state['words'])}`\n"
         f"Link templates loaded: `{len(state['links'])}`\n"
         f"Total combinations to check: `{combos}`\n"
+        f"Manual /check running: {'yes ⏳' if check_running else 'no'}\n"
         f"Auto-check: {autocheck}\n"
         f"Autocheck cycles run: `{state['cycles_run']}`\n"
         f"Last check: {last_run} — checked `{state['last_run_checked']}`, "
@@ -396,6 +484,10 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = get_state(chat_id)
 
+    if state["check_task"] is not None and not state["check_task"].done():
+        await update.message.reply_text("⏳ A check is already running. Use /cancel to stop it first.")
+        return
+
     if not state["words"] or not state["links"]:
         await update.message.reply_text(
             "⚠️ Please send both *wordlist.txt* and *linklist.txt* first.\nUse /help to see how.",
@@ -409,18 +501,41 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     progress_msg = await update.message.reply_text(
-        f"🔎 Starting check of `{len(urls)}` link(s)...", parse_mode=ParseMode.MARKDOWN
+        f"🔎 Starting check of `{len(urls)}` link(s)...\n_Send /cancel to stop._",
+        parse_mode=ParseMode.MARKDOWN,
     )
 
-    working = await perform_check(context.bot, chat_id, urls, progress_message=progress_msg)
+    task = asyncio.create_task(perform_check(context.bot, chat_id, urls, progress_message=progress_msg))
+    state["check_task"] = task
+
+    working: list[str] = []
+    was_cancelled = False
+    try:
+        working = await task
+    except asyncio.CancelledError:
+        was_cancelled = True
+    finally:
+        state["check_task"] = None
 
     state["ever_working"].update(working)
     state["last_run_time"] = time.time()
     state["last_run_checked"] = len(urls)
     state["last_run_working"] = len(working)
 
-    if not working:
+    if not was_cancelled and not working:
         await update.message.reply_text(f"❌ Checked {len(urls)} link(s) — none are working right now.")
+
+
+@restricted
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+    task = state.get("check_task")
+    if task is not None and not task.done():
+        task.cancel()
+        await update.message.reply_text("🛑 Cancelling the current check...")
+    else:
+        await update.message.reply_text("There's no check currently running.")
 
 
 async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
@@ -435,7 +550,7 @@ async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     # No live progress message for automatic cycles — but every working
-    # link found is still messaged immediately, every single cycle.
+    # link found is still queued and sent (with retries), every cycle.
     working = await perform_check(context.bot, chat_id, urls, progress_message=None)
 
     state["ever_working"].update(working)
@@ -608,6 +723,7 @@ def main():
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler(["cancel", "cancle"], cancel_cmd))
     app.add_handler(CommandHandler("autocheck", autocheck_cmd))
     app.add_handler(CommandHandler("stopautocheck", stopautocheck_cmd))
     app.add_handler(CommandHandler("resetstats", resetstats_cmd))

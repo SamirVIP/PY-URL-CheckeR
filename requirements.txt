@@ -1,3 +1,8 @@
 python-telegram-bot[job-queue]==21.6
 aiohttp==3.10.5
 python-dotenv==1.0.1
+
+# Speed boosters (used automatically when installed; Linux/macOS).
+# If either fails to install on your system you can delete its line - the bot still works.
+uvloop>=0.19; sys_platform != "win32"
+aiodns>=3.2; sys_platform != "win32"

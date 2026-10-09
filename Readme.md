@@ -1,157 +1,123 @@
 # Python Url Checker — Telegram Bot
 
-A Telegram bot that takes a `wordlist.txt` and a `linklist.txt` (links
-containing a `(Word)` placeholder), builds every link×word combination,
-checks them all **fast** (concurrently, with `asyncio` + `aiohttp`), and
-messages you the moment a link is actually working — with the image
-attached. It can also loop automatically every 1–10 minutes and only
-pings you about *newly* found working links.
+Send the bot a `wordlist.txt` and a `linklist.txt` (links containing a
+`(Word)` placeholder). It tests **every link with every word** — up to
+**600,000 combinations per run** — at high speed, sends you every working
+link with its image, shows live progress with speed and time left, and can
+repeat the whole check automatically every 1–10 minutes.
 
-Only chat IDs you allow can use it.
+Works in private chats **and Telegram groups** (only chats you allow).
 
-## 1. Create your bot
+## Files
 
-1. Open Telegram, message **[@BotFather](https://t.me/BotFather)**.
-2. Send `/newbot` and follow the prompts.
-3. BotFather gives you a token like `123456789:AAExampleTokenGoesHere` — copy it.
+| File | What it is |
+|---|---|
+| `bot.py` | The Telegram bot (run this one) |
+| `checker.py` | The fast checking engine (used by `bot.py`, keep it in the same folder) |
+| `requirements.txt` | Python packages |
+| `.env.example` | Settings template → copy to `.env` |
+| `sample_wordlist.txt`, `sample_linklist.txt` | Example input files |
 
-## 2. Find your chat ID
+## Setup
 
-1. Message **[@userinfobot](https://t.me/userinfobot)** on Telegram — it replies with your numeric ID.
-2. (You can allow multiple chat IDs — e.g. yourself + a group.)
-
-## 3. Install & configure
-
-```bash
-cd python-url-checker-bot
-pip install -r requirements.txt
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```
-BOT_TOKEN=123456789:AAExampleTokenGoesHere
-ALLOWED_CHAT_IDS=111111111,222222222
-```
-
-## 4. Run it
-
-```bash
-python bot.py
-```
-
-Leave this running (use a VPS, a small server, `screen`/`tmux`, `pm2`,
-or a systemd service so it keeps running in the background 24/7).
-
-## 5. Use it in Telegram
-
-1. Send `/start` to your bot.
-2. Send `wordlist.txt` as a **file/document** (not pasted text) — one word per line:
+1. Create a bot with **@BotFather** → copy the token.
+2. Find your own ID with **@userinfobot**.
+3. Install and configure:
+   ```bash
+   pip install -r requirements.txt
+   cp .env.example .env      # then edit .env (BOT_TOKEN, ALLOWED_CHAT_IDS)
+   python bot.py
    ```
-   ShadowRing
-   PowlerRing
-   ```
-3. Send `linklist.txt` as a file — one URL per line, `(Word)` marks where each word goes:
+   Keep it running 24/7 with `tmux`/`screen`, `pm2` or a `systemd` service.
+
+## Using it
+
+1. Send `wordlist.txt` as a **file** — one word per line.
+2. Send `linklist.txt` as a **file** — one link per line, `(Word)` marks where the word goes:
    ```
    https://dl.dir.freefiremobile.com/common/Local/BD/Splashanno/1750x1070_M1917(Word)_en.jpg
-   https://dl.dir.freefiremobile.com/common/Local/BD/Splashanno/1750x1070_G36(Word)_en.jpg
    ```
-   (Sample files matching your example are included: `sample_wordlist.txt`, `sample_linklist.txt`.)
-4. Send `/check` — the bot builds every combination and checks them all
-   at once, then reports any that are working (200 OK), with the image.
-5. To make it keep checking automatically, send e.g. `/autocheck 5` —
-   it will re-check everything every 5 minutes and message you whenever
-   a **new** working link appears. Stop it any time with `/stopautocheck`.
+   (`(word)`/`(WORD)` also work. Files can have any name containing `wordlist` / `linklist`,
+   e.g. `wordlist (1).txt`. Max 20 MB each — Telegram's limit for bots.)
+3. Send `/check`.
 
-### All commands
+Live progress example:
+```
+🔎 Checking links...
+████████░░░░░░░░░░░░ 41.3%
+Checked: 247,800 / 600,000
+Working found: 3
+Speed: 2,950 links/sec
+Elapsed: 1m 24s
+Time left: ~1m 59s
+```
+
+### Commands
 
 | Command | What it does |
 |---|---|
-| `/start` | Welcome message |
-| `/help` | Full instructions |
-| `/check` | Check every link×word combination right now, with **live progress** — guarantees every working link found gets sent to you |
-| `/cancel` | Stop a `/check` that's currently running (also works as `/cancle`) |
-| `/autocheck N` | Auto re-check every N minutes (1–10) |
-| `/stopautocheck` | Stop the automatic loop and its 30-minute status updates |
-| `/resetstats` | Clear the "working links seen" counter shown in `/status` |
-| `/status` | Show how many words/links are loaded, combo count, autocheck state, cycle stats |
+| `/start`, `/help` | Welcome / help |
+| `/check` | Check every link with every word (live progress + time left) |
+| `/cancel` (or `/cancle`) | Stop the running check — everything found so far is still delivered |
+| `/autocheck N` | Re-check automatically every N minutes (1–10) |
+| `/stopautocheck` | Stop automatic checking |
+| `/status` | What's loaded / running, progress, time left |
+| `/resetstats` | Clear statistics |
+| `/id` | Show this chat's ID |
+| `/allow [id]`, `/disallow [id]`, `/allowed` | (admin) manage allowed chats |
 
-## How checking & notifications work
+## Groups
 
-- **Every** working link (HTTP 200, and not an HTML "not found" page in
-  disguise) is queued the instant it's confirmed and sent by a single
-  dedicated sender — this guarantees every one gets delivered, even
-  when dozens are found in the same second, instead of firing them all
-  at once and risking some getting silently dropped by Telegram's rate
-  limits. If Telegram briefly rate-limits a send, it's retried
-  automatically rather than lost.
-- Notifications are sent as **plain text** (no Markdown formatting).
-  Earlier versions used Markdown, and Telegram treats a single
-  underscore (`_`) as an italics marker — a real filename like
-  `..._en.jpg` has an odd number of underscores, which made Telegram
-  reject the whole message and silently drop it. Plain text avoids that
-  entirely, for underscores or any other character that shows up in a link.
-- `/check` shows a live progress message that updates every few seconds:
-  `Progress: 340/1000 — Working found so far: 2`, and can be stopped
-  any time with `/cancel` — anything already found up to that point
-  still gets sent before it stops.
-- `/autocheck N` re-checks the full combination list every N minutes,
-  and messages you **every time** it finds a working link — every
-  cycle, even if it already reported that same link before. (If a link
-  stays live across multiple cycles, you'll get repeated notifications
-  — that's intentional, so you never miss a "still working" confirmation.)
-- Separately, while autocheck is on, a **status update is sent every 30
-  minutes** — independent of your check interval — summarizing cycles
-  run, last check size, and total unique working links seen so far.
+1. Add the bot to your group.
+2. Send `/id` in the group — it shows the group ID (a negative number like `-1001234567890`).
+3. Allow it, either way:
+   - add the ID to `ALLOWED_CHAT_IDS` in `.env` and restart, **or**
+   - as an admin (any personal ID in `ALLOWED_CHAT_IDS`), just send `/allow` inside the group. No restart needed.
+4. **To upload the word/link files inside a group**, the bot must be able to see them:
+   either make the bot a group admin, or in @BotFather run `/setprivacy` → *Disable*
+   (then remove and re-add the bot to the group).
+   Each chat keeps its own lists, so upload the files in the chat where you run `/check`.
 
-## Notes on speed & reliability
+Everyone in an allowed group can use the bot. Telegram limits bots to ~20 messages per minute in a
+group, so when many links are found at once they arrive a bit slower there — nothing is lost (a
+`working_links_….txt` file with the **complete** list is also sent when the check ends).
+Anonymous group admins can't use `/allow` (Telegram hides their identity); use `.env` instead.
 
-- Checks run concurrently (`MAX_CONCURRENT_REQUESTS`, default 150 at a
-  time) using real `GET` requests. Earlier versions used `HEAD` first,
-  which some CDNs answer inconsistently versus a real `GET` — that was
-  causing genuinely live links to be missed. `GET` is what actually
-  matters, so that's what's used to decide "working."
-- If a server starts blocking you for going too fast, lower
-  `MAX_CONCURRENT_REQUESTS` in `.env`.
-- Each chat's uploaded files are stored under `data/<chat_id>/`, so they
-  survive a bot restart.
+## How it is fast
 
-## Notes on security
+* **Several worker processes** (one per CPU core, max 4) — the checking uses all your cores and never slows the bot down.
+* **uvloop** and **aiodns** are used automatically when installed.
+* Connections are **reused** and only one byte of each file is requested (nothing is downloaded).
+* Links are generated on the fly, so 600,000 combinations use very little memory.
 
-- The bot refuses to respond to any chat ID not listed in
-  `ALLOWED_CHAT_IDS` — it just tells them their chat ID and stops there.
-- If `ALLOWED_CHAT_IDS` is left empty, the bot allows **nobody** (safe
-  default) — you must configure it before use.
+Real speed depends mostly on your server and the target server. If it starts rejecting you
+(many errors/429), lower `CONCURRENCY` in `.env`; if your CPU is idle you can raise it.
 
-## Deploying so it runs 24/7
+## How it makes sure nothing is missed
 
-Any small VPS works. A couple of simple options:
+* Every link × every word is checked. The check summary shows `links × words = total` and `Checked: N`.
+* Network errors, timeouts, HTTP 429 and 5xx are **never** treated as "not found": each link is retried
+  with back-off, and anything still failing is re-checked in extra rounds at the end.
+* If a link still can't be verified, it is reported (`Could not verify: N`) and listed in
+  `unverified_links_….txt` — it is never silently counted as "not working".
+* If the server blocks you completely (thousands of errors in a row), the run stops early and says so,
+  instead of running for hours.
+* Blank lines, duplicates, Windows line endings and a UTF-8 BOM at the start of a file are handled
+  (a BOM used to corrupt the first word).
+* Every working link is sent as its own message with the image (plain text, so underscores `_` in
+  links are safe). If Telegram can't fetch an image, the link is sent as text instead.
+  At the end you also get `working_links_….txt` with all of them.
 
-**tmux / screen** (quick and simple):
-```bash
-tmux new -s urlchecker
-python bot.py
-# press Ctrl+B then D to detach; it keeps running
-```
+## Auto-check
 
-**systemd service** (auto-restarts on crash/reboot) — create
-`/etc/systemd/system/urlchecker.service`:
-```ini
-[Unit]
-Description=Python Url Checker Telegram Bot
-After=network.target
+`/autocheck 5` re-checks everything every 5 minutes and messages you **every time** a working link
+is found (every cycle). A status update is sent every 30 minutes (cycles done, last result, and the
+progress/time-left of a cycle that is currently running). If a check takes longer than the interval,
+the next one waits — checks never overlap. Note: auto-check is not remembered after the bot restarts.
 
-[Service]
-WorkingDirectory=/path/to/python-url-checker-bot
-ExecStart=/usr/bin/python3 bot.py
-Restart=always
-EnvironmentFile=/path/to/python-url-checker-bot/.env
+## Troubleshooting
 
-[Install]
-WantedBy=multi-user.target
-```
-Then:
-```bash
-sudo systemctl enable --now urlchecker
-```
+* **`/cancel` seems slow** → it stops the workers within a second; the summary message then appears.
+* **Nothing found but you expect links** → try a quick manual test of one URL in a browser; check the
+  `(Word)` placeholder spelling and that your files were loaded (`/status`).
+* **Many "could not verify"** → the server is rate-limiting you; lower `CONCURRENCY`.

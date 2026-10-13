@@ -1,1384 +1,835 @@
+#!/usr/bin/env python3
 """
-Python Url Checker - Telegram Bot
-==================================
+checker.py - high-speed URL checking engine for Python Url Checker bot
+=====================================================================
 
-Send the bot two files:
-  wordlist.txt  - one word per line
-  linklist.txt  - one link per line, with (Word) where the word goes
+The bot (bot.py) uses this module in two ways:
 
-/check tests EVERY link with EVERY word (up to 600,000 combinations per
-run) using the multi-process engine in checker.py. A link only counts as
-working when the file is REALLY there (real image bytes, not a
-placeholder the server returns for everything). Every working link is
-sent with its image and its "Last modified" date in Bangladesh time.
+1. As a library: read_lines(), count_combinations(), iter_urls() and the
+   CheckRun class (which runs inside the bot's event loop).
 
-Commands
---------
-/start            welcome
-/help             help
-/check            check everything now (live progress + time left)
-/cancel           stop a running check (alias: /cancle)
-/addword W1 W2    add words to your list AND instantly check only those
-/test LINK        diagnose one link (what does the server really answer?)
-/found            every working link found so far (newest first)
-/autocheck N      re-check automatically every N minutes (1-10)
-/stopautocheck    stop automatic checking
-/notify all|new   auto-check alerts: every time, or only NEW links
-/status           what is loaded / running
-/resetstats       clear the counters
-/id               show this chat's ID (use it to allow a group)
-/allow [id]       (admin) allow this chat or the given chat ID
-/disallow [id]    (admin) remove a chat added with /allow
-/allowed          (admin) list allowed chats
+2. As a program: CheckRun launches several copies of this very file as
+   worker subprocesses ("python checker.py --worker"). Each worker
+   checks its own share of the URLs, so checking uses ALL your CPU
+   cores instead of just one, and the heavy network work never slows
+   down the Telegram bot itself.
+
+Why it is fast
+--------------
+* Several worker processes (one per CPU core, up to 4 by default).
+* uvloop (a much faster event loop) is used automatically if installed.
+* A fixed pool of workers pulls URLs from a generator, so even 600,000
+  combinations never create 600,000 tasks or a giant list in memory.
+* Keep-alive connections are reused (the file is requested with a
+  "Range: bytes=0-0" header, so no image data is downloaded at all).
+* DNS results are cached.
+
+Why nothing is skipped
+----------------------
+* Network errors, timeouts, HTTP 429 and 5xx answers are never treated
+  as "not found". They are retried several times with back-off, and
+  anything still failing is re-tried again in extra rounds at the end.
+* Whatever still cannot be verified after all that is reported
+  explicitly as "unverified" (and listed in a file) - it is never
+  silently counted as "not working".
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import itertools
 import json
-import logging
 import os
-import shutil
-import tempfile
+import random
+import re
+import sys
+import threading
 import time
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
-from functools import wraps
-from html import escape
+from collections import deque
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import quote
 
 import aiohttp
-from telegram import BotCommand, LinkPreviewOptions, Update
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
-from telegram.ext import (
-    Application,
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+
+CHECKER_PATH = Path(__file__).resolve()
+
+# "(Word)" placeholder - matched case-insensitively, so (word) / (WORD) work too.
+PLACEHOLDER_RE = re.compile(r"\(word\)", re.IGNORECASE)
+
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 )
-
-import checker
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-
-# ============================================================
-# CONFIG
-# ============================================================
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, "").strip() or default)
-    except ValueError:
-        return default
-
-
-def _parse_ids(text: str) -> set[int]:
-    ids = set()
-    for part in text.replace(";", ",").split(","):
-        part = part.strip()
-        if part:
-            try:
-                ids.add(int(part))
-            except ValueError:
-                pass
-    return ids
-
-
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGkwwoRzvAz9Y3Zcan_JtLKxyeNEm8gS_M").strip()
-
-# Chats (private chats AND groups) that may use the bot. Group IDs are
-# negative numbers like -1001234567890.
-ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961"))
-# People who may use /allow and /disallow. Defaults to every positive
-# (= personal) ID in ALLOWED_CHAT_IDS.
-ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_IDS", "6206433961")) | {i for i in ENV_ALLOWED if i > 0}
-
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
-DATA_DIR.mkdir(exist_ok=True)
-
-MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 600_000)   # per run
-CONCURRENCY = _env_int("CONCURRENCY", 600)                 # simultaneous requests, all workers together
-PROCESSES = _env_int("PROCESSES", 0) or None               # 0 = automatic
-CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 8.0)
-TOTAL_TIMEOUT = _env_float("TOTAL_TIMEOUT", 15.0)
-ATTEMPTS = _env_int("ATTEMPTS", 3)
-
-# Safety net: most link messages one run may send (the results file always has ALL).
-# 0 = unlimited.
-MAX_ALERTS_PER_RUN = _env_int("MAX_ALERTS_PER_RUN", 500)
-# Largest image the bot will download to send you (Telegram bots can upload up to 50 MB).
-MAX_IMAGE_BYTES = _env_int("MAX_IMAGE_MB", 20) * 1024 * 1024
-
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024        # Telegram bots can download files up to 20 MB
-HISTORY_LIMIT = 50_000
-
-PROGRESS_SECONDS_PRIVATE = 3.0
-PROGRESS_SECONDS_GROUP = 6.0               # groups have stricter Telegram rate limits
-NOTIFY_PACE_PRIVATE = 0.3                  # pause between "working link" messages
-NOTIFY_PACE_GROUP = 1.5
-HEARTBEAT_SECONDS = 30 * 60                # autocheck status update interval
-AUTO_FILE_THRESHOLD = 10                   # autocheck sends a results file when >= this many found
-
-MIN_AUTOCHECK_MINUTES = 1
-MAX_AUTOCHECK_MINUTES = 10
-
-HTML = ParseMode.HTML
-NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("python-url-checker-bot")
-
-
-# ============================================================
-# ALLOWED CHATS (env list + chats added with /allow)
-# ============================================================
-
-ALLOWED_FILE = DATA_DIR / "allowed_chats.json"
-
-
-def _load_dynamic() -> set[int]:
-    try:
-        return {int(x) for x in json.loads(ALLOWED_FILE.read_text())}
-    except Exception:
-        return set()
-
-
-dynamic_allowed: set[int] = _load_dynamic()
-
-
-def _save_dynamic():
-    ALLOWED_FILE.write_text(json.dumps(sorted(dynamic_allowed)))
-
-
-def is_allowed(chat_id: int) -> bool:
-    # If nobody is configured, nobody is allowed (safe default).
-    return chat_id in ENV_ALLOWED or chat_id in dynamic_allowed
-
-
-def restricted(handler):
-    @wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat, msg = update.effective_chat, update.effective_message
-        if chat is None or msg is None:
-            return
-        if not is_allowed(chat.id):
-            await msg.reply_text(
-                "🚫 Sorry, this chat is not authorized to use this bot.\n"
-                f"Chat ID: <code>{chat.id}</code>\n\n"
-                "The bot owner can allow it by adding this ID to <code>ALLOWED_CHAT_IDS</code> "
-                "or by sending /allow here.",
-                parse_mode=HTML,
-            )
-            return
-        return await handler(update, context)
-    return wrapper
-
-
-# ============================================================
-# DATES, SIZES  (Last modified is shown in Bangladesh time, 12-hour clock)
-# ============================================================
-
-BD_TZ = timezone(timedelta(hours=6))      # Bangladesh: UTC+6, no daylight saving
-_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
-
-def parse_http_date(raw) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        dt = parsedate_to_datetime(str(raw))
-    except Exception:
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def fmt_bd(raw) -> str | None:
-    """'Mon, 09 Feb 2026 - 12:30 PM (Bangladesh Time)' from a Last-Modified header."""
-    dt = parse_http_date(raw)
-    if dt is None:
-        return None
-    dt = dt.astimezone(BD_TZ)
-    hour12 = dt.hour % 12 or 12
-    ampm = "AM" if dt.hour < 12 else "PM"
-    return (f"{_DAYS[dt.weekday()]}, {dt.day:02d} {_MONTHS[dt.month - 1]} {dt.year} - "
-            f"{hour12:02d}:{dt.minute:02d} {ampm} (Bangladesh Time)")
-
-
-def lm_epoch(raw) -> float:
-    dt = parse_http_date(raw)
-    return dt.timestamp() if dt else 0.0
-
-
-def fmt_size(n) -> str | None:
-    if not n:
-        return None
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-
-
-def fmt_dur(seconds: float) -> str:
-    s = int(max(0, seconds))
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h}h {m:02d}m {sec:02d}s"
-    if m:
-        return f"{m}m {sec:02d}s"
-    return f"{sec}s"
-
-
-def retry_seconds(exc: RetryAfter) -> float:
-    ra = exc.retry_after
-    return (ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 0.5
-
-
-# ============================================================
-# PER-CHAT STATE (lists, settings and history are saved on disk)
-# ============================================================
-
-chat_state: dict[int, dict] = {}
-
-
-def chat_dir(chat_id: int) -> Path:
-    d = DATA_DIR / str(chat_id)
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def _read_json(path: Path, default):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-def save_settings(chat_id: int):
-    st = chat_state[chat_id]
-    (chat_dir(chat_id) / "settings.json").write_text(
-        json.dumps({"interval": st["interval_minutes"], "notify": st["notify_mode"]}), encoding="utf-8")
-
-
-def save_history(chat_id: int):
-    hist = chat_state[chat_id]["history"]
-    if len(hist) > HISTORY_LIMIT:                       # keep the newest entries
-        keep = sorted(hist.items(), key=lambda kv: kv[1].get("first", 0), reverse=True)[:HISTORY_LIMIT]
-        hist.clear()
-        hist.update(keep)
-    (chat_dir(chat_id) / "found_history.json").write_text(json.dumps(hist), encoding="utf-8")
-
-
-def get_state(chat_id: int) -> dict:
-    if chat_id not in chat_state:
-        d = chat_dir(chat_id)
-        settings = _read_json(d / "settings.json", {})
-        notify = settings.get("notify", "all")
-        chat_state[chat_id] = {
-            "words": checker.read_lines(d / "wordlist.txt")[0],
-            "links": checker.read_lines(d / "linklist.txt")[0],
-            "history": _read_json(d / "found_history.json", {}),   # url -> {"first": epoch, "lm": raw}
-            "notify_mode": notify if notify in ("all", "new") else "all",
-            "interval_minutes": settings.get("interval"),
-            "run": None,                 # the running checker.CheckRun, if any
-            "run_kind": None,            # "manual" or "auto"
-            "busy": False,               # True from the moment a check is started
-            "pending_cancel": False,
-            "stop_notify": False,
-            "cycles_run": 0,
-            "skipped_cycles": 0,
-            "last_run_time": None,
-            "last_run_checked": 0,
-            "last_run_working": 0,
-            "last_run_unverified": 0,
-        }
-    return chat_state[chat_id]
-
-
-# ============================================================
-# TEXT BUILDERS
-# ============================================================
-
-def render_progress(run: checker.CheckRun) -> str:
-    s = run.snapshot()
-    total = s["total"] or 1
-    pct = min(100.0, s["processed"] * 100.0 / total)
-    filled = int(pct // 5)
-    bar = "█" * filled + "░" * (20 - filled)
-    lines = [
-        "🔎 Checking links...",
-        f"{bar} {pct:.1f}%",
-        f"Checked: {s['processed']:,} / {s['total']:,}",
-        f"Working found: {s['found']:,}",
-    ]
-    if s["speed"] > 0:
-        lines.append(f"Speed: {s['speed']:,.0f} links/sec")
-    lines.append(f"Elapsed: {fmt_dur(s['elapsed'])}")
-    if s["in_retry"]:
-        lines.append(f"Re-checking {s['retrying']:,} links that had network errors...")
-        lines.append("Time left: almost done")
-    elif s["eta"] is not None:
-        lines.append(f"Time left: ~{fmt_dur(s['eta'])}")
-    else:
-        lines.append("Time left: calculating...")
-    if s["retrying"] and not s["in_retry"]:
-        lines.append(f"Retrying (network errors): {s['retrying']:,}")
-    if run.suspicious:
-        lines.append("⚠️ Unusually many links look 'working' - the server may be answering everything.")
-    lines.append(f"Worker processes: {s['processes']}")
-    lines.append("Send /cancel to stop.")
-    return "\n".join(lines)
-
-
-def build_summary(run: checker.CheckRun, extra: list[str] | None = None) -> str:
-    if run.cancelled:
-        head = "🛑 Check cancelled."
-    elif run.aborted or run.crashed or run.errors:
-        head = "⚠️ Check stopped early."
-    elif run.unverified_count:
-        head = "⚠️ Check finished, but some links could not be verified."
-    else:
-        head = "✅ Check complete!"
-    checked = f"{run.processed:,}" + (f" of {run.total:,}" if run.processed != run.total else "")
-    lines = [
-        head,
-        f"Link templates: {len(run.links):,}  |  Words: {len(run.words):,}",
-        f"Total combinations: {run.total:,}",
-        f"Checked: {checked}",
-        f"Working found: {len(run.found):,}",
-    ]
-    if run.unverified_count:
-        lines.append(f"Could not verify: {run.unverified_count:,} (network/server errors - list attached)")
-    el = run.elapsed()
-    avg = f" (average {run.processed / el:,.0f} links/sec)" if el > 0 and run.processed else ""
-    lines.append(f"Time taken: {fmt_dur(el)}{avg}")
-    if run.soft404:
-        lines.append("ℹ️ This server answers non-existent links with a placeholder - those were filtered out automatically.")
-    if run.suspicious:
-        pct = len(run.found) * 100 / max(1, run.processed)
-        lines.append(f"⚠️ {pct:.0f}% of the links look 'working'. That is not normal, so these results may be wrong. "
-                     "Send /test <one link> to see what the server really answers.")
-    if run.aborted:
-        lines.append("The server stopped answering (too many errors in a row). "
-                     "Try again later or lower CONCURRENCY in .env.")
-    if run.crashed:
-        lines.append(f"{len(run.crashed)} worker process(es) crashed - results may be incomplete.")
-    if run.errors:
-        lines.append(f"Error: {run.errors[0][:200]}")
-    lines.extend(extra or [])
-    return "\n".join(lines)
-
-
-def build_caption(url: str, lm_raw, size, known: bool) -> str:
-    head = "✅ Working Link Found! (seen before)" if known else "🆕 NEW Working Link Found!"
-    lines = [head, url, "", "📅 Last modified:", fmt_bd(lm_raw) or "not provided by the server"]
-    sz = fmt_size(size)
-    if sz:
-        lines.append(f"📦 Size: {sz}")
-    return "\n".join(lines)
-
-
-def result_lines(items: list[tuple[str, str | None]]) -> list[str]:
-    """[(url, last_modified_raw)] -> text lines, newest file first."""
-    rows = sorted(((lm_epoch(raw), url, fmt_bd(raw)) for url, raw in items), key=lambda r: r[0], reverse=True)
-    return [f"{url}  |  Last modified: {lm or 'not provided by the server'}" for _, url, lm in rows]
-
-
-# ============================================================
-# SENDING "WORKING LINK" MESSAGES (never lose one)
-# ============================================================
-
-class Notifier:
-    """Sends found links one by one (paced + retried), WITH the image.
-
-    How an image is delivered (first one that works):
-      1. the bot downloads the picture itself and uploads it as a photo
-      2. if Telegram refuses it as a photo (too big / odd shape) -> as a file
-      3. if the picture can't be downloaded -> Telegram is asked to fetch the link
-      4. last resort -> the link as text
-    Plain text only (no Markdown): "_" in a link must never break a message.
-    """
-
-    def __init__(self, bot, chat_id: int, mode: str, history: dict):
-        self.bot, self.chat_id, self.mode, self.history = bot, chat_id, mode, history
-        self.pace = NOTIFY_PACE_GROUP if chat_id < 0 else NOTIFY_PACE_PRIVATE
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.pending = 0
-        self.accepted = 0
-        self.sent = 0
-        self.suppressed_cap = 0
-        self.suppressed_known = 0
-        self.failed: list[str] = []
-        self.http = aiohttp.ClientSession(
-            connector=aiohttp.TCPConnector(ssl=False),
-            timeout=aiohttp.ClientTimeout(total=60),
-            headers=checker.BASE_HEADERS,
-            cookie_jar=aiohttp.DummyCookieJar(),
-        )
-        self.task = asyncio.create_task(self._loop())
-
-    def add(self, url: str, meta: dict):
-        known = url in self.history
-        if self.mode == "new" and known:
-            self.suppressed_known += 1
-            return
-        if MAX_ALERTS_PER_RUN and self.accepted >= MAX_ALERTS_PER_RUN:
-            self.suppressed_cap += 1
-            return
-        self.accepted += 1
-        self.pending += 1
-        self.queue.put_nowait((url, meta or {}, known))
-
-    async def _loop(self):
-        while True:
-            url, meta, known = await self.queue.get()
-            try:
-                if await self.deliver(url, meta, known):
-                    self.sent += 1
-                else:
-                    self.failed.append(url)
-                await asyncio.sleep(self.pace)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception("Could not deliver %s", url)
-                self.failed.append(url)
-            finally:
-                self.pending -= 1
-
-    async def _download(self, url: str):
-        """Returns (bytes | None, last_modified_raw | None, size | None)."""
-        try:
-            async with self.http.get(url, allow_redirects=True, max_redirects=5) as resp:
-                if resp.status != 200:
-                    return None, None, None
-                lm = resp.headers.get("Last-Modified")
-                clen = resp.headers.get("Content-Length")
-                size = int(clen) if clen and clen.isdigit() else None
-                if size and size > MAX_IMAGE_BYTES:
-                    return None, lm, size
-                buf = bytearray()
-                async for chunk in resp.content.iter_chunked(65536):
-                    buf += chunk
-                    if len(buf) > MAX_IMAGE_BYTES:
-                        return None, lm, len(buf)
-                return bytes(buf), lm, len(buf)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.info("Could not download %s: %s", url, e)
-            return None, None, None
-
-    async def _try(self, send, attempts: int = 5) -> bool:
-        """Run one Telegram send. True = delivered, False = Telegram refused it (try the next way)."""
-        for _ in range(attempts):
-            try:
-                await send()
-                return True
-            except RetryAfter as e:                      # Telegram says: slow down
-                await asyncio.sleep(retry_seconds(e))
-            except (BadRequest, Forbidden) as e:         # must come before NetworkError (BadRequest is a subclass)
-                logger.info("Telegram refused a message: %s", e)
-                return False
-            except (TimedOut, NetworkError):
-                await asyncio.sleep(1.5)
-            except Exception:
-                logger.exception("Unexpected error while sending")
-                return False
-        return False
-
-    async def deliver(self, url: str, meta: dict, known: bool) -> bool:
-        bot, chat_id = self.bot, self.chat_id
-        data, lm, size = await self._download(url)
-        caption = build_caption(url, lm or meta.get("lm"), size or meta.get("sz"), known)
-        filename = (url.split("?", 1)[0].rsplit("/", 1)[-1] or "image.jpg")
-
-        if data:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=data, caption=caption)):
-                return True
-            if await self._try(lambda: bot.send_document(chat_id=chat_id, document=data,
-                                                         filename=filename, caption=caption)):
-                return True
-        else:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=url, caption=caption)):
-                return True
-        return await self._try(lambda: bot.send_message(chat_id=chat_id, text=caption))
-
-    async def drain(self, should_abort, timeout: float | None = None):
-        start = time.monotonic()
-        while self.pending > 0 and not should_abort():
-            if timeout is not None and time.monotonic() - start > timeout:
-                return
-            await asyncio.sleep(0.3)
-
-    async def aclose(self):
-        self.task.cancel()
-        await asyncio.gather(self.task, return_exceptions=True)
-        try:
-            await self.http.close()
-        except Exception:
-            pass
-
-
-async def progress_loop(run: checker.CheckRun, msg, chat_id: int):
-    interval = PROGRESS_SECONDS_GROUP if chat_id < 0 else PROGRESS_SECONDS_PRIVATE
-    last = None
-    while not run.finished:
-        await asyncio.sleep(interval)
-        if run.finished:
-            break
-        text = render_progress(run)
-        if text == last:
-            continue
-        try:
-            await msg.edit_text(text)
-            last = text
-        except RetryAfter as e:
-            await asyncio.sleep(retry_seconds(e))
-        except Exception:
-            pass  # "message is not modified" etc. - harmless
-
-
-async def send_text_file(bot, chat_id: int, path: Path, caption: str):
-    for _ in range(2):
-        try:
-            with open(path, "rb") as f:
-                await bot.send_document(chat_id=chat_id, document=f, filename=path.name, caption=caption)
-            return
-        except RetryAfter as e:
-            await asyncio.sleep(retry_seconds(e))
-        except Exception:
-            logger.exception("Could not send file %s", path)
-            return
-
-
-# ============================================================
-# RUNNING A CHECK
-# ============================================================
-
-async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, words_override=None):
-    """Run one complete check for a chat (kind = "manual" or "auto").
-    words_override: check only these words (used by /addword)."""
-    state = get_state(chat_id)
-    workdir = None
-    notifier = None
-    ptask = None
-    try:
-        workdir = Path(tempfile.mkdtemp(prefix="run_", dir=str(chat_dir(chat_id))))
-        words = list(words_override) if words_override is not None else list(state["words"])
-        run = checker.CheckRun(
-            list(state["links"]), words,
-            workdir=workdir, processes=PROCESSES, concurrency=CONCURRENCY,
-            connect_timeout=CONNECT_TIMEOUT, total_timeout=TOTAL_TIMEOUT, attempts=ATTEMPTS,
-        )
-        state["run"], state["run_kind"] = run, kind
-        state["stop_notify"] = False
-        if state["pending_cancel"]:
-            state["pending_cancel"] = False
-            run.cancel()
-
-        # Auto-check can be set to alert only for NEW links; manual checks always show everything.
-        mode = state["notify_mode"] if kind == "auto" else "all"
-        notifier = Notifier(bot, chat_id, mode, state["history"])
-        if progress_msg is not None:
-            ptask = asyncio.create_task(progress_loop(run, progress_msg, chat_id))
-
-        try:
-            await run.run(on_found=notifier.add)
-        except asyncio.CancelledError:
-            run.shutdown()
-            raise
-        except Exception as e:
-            logger.exception("Check failed")
-            run.errors.append(repr(e))
-
-        if ptask is not None:
-            ptask.cancel()
-            await asyncio.gather(ptask, return_exceptions=True)
-            ptask = None
-
-        def stop_sending() -> bool:
-            return run.cancelled or state["stop_notify"]
-
-        # Give the individual "working link" messages a moment to go out.
-        await notifier.drain(stop_sending, timeout=30)
-
-        # ---- statistics + history ----
-        state["last_run_time"] = time.time()
-        state["last_run_checked"] = run.processed
-        state["last_run_working"] = len(run.found)
-        state["last_run_unverified"] = run.unverified_count
-        if kind == "auto" and not run.cancelled:
-            state["cycles_run"] += 1
-        if run.found and not run.suspicious:      # never pollute the history with doubtful results
-            now = time.time()
-            for url in run.found:
-                lm = (run.found_meta.get(url) or {}).get("lm")
-                entry = state["history"].setdefault(url, {"first": now, "lm": lm})
-                if lm:
-                    entry["lm"] = lm
-            try:
-                save_history(chat_id)
-            except Exception:
-                logger.exception("Could not save history")
-
-        # ---- final report ----
-        extra = []
-        if notifier.suppressed_cap:
-            extra.append(f"Only the first {MAX_ALERTS_PER_RUN} link messages were sent "
-                         f"({notifier.suppressed_cap:,} more are in the file).")
-        if notifier.suppressed_known:
-            extra.append(f"{notifier.suppressed_known:,} already-known link(s) were not repeated (/notify new).")
-        if notifier.pending > 0 and not stop_sending():
-            extra.append(f"Still sending {notifier.pending:,} working-link message(s) - "
-                         "the file below already contains all of them.")
-        summary = build_summary(run, extra)
-        problem = bool(run.aborted or run.crashed or run.errors)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        if kind == "manual":
-            try:
-                await progress_msg.edit_text(summary)
-            except Exception:
-                await bot.send_message(chat_id=chat_id, text=summary)
-        elif problem:
-            await bot.send_message(chat_id=chat_id, text="⚠️ Auto-check problem:\n" + summary)
-
-        if run.found and (kind == "manual" or len(run.found) >= AUTO_FILE_THRESHOLD):
-            p = workdir / f"working_links_{stamp}.txt"
-            lines = result_lines([(u, (run.found_meta.get(u) or {}).get("lm")) for u in run.found])
-            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
-            await send_text_file(bot, chat_id, p,
-                                 f"All {len(run.found):,} working link(s) from this check (newest file first).")
-
-        if run.unverified_count and kind == "manual":
-            p = workdir / f"unverified_links_{stamp}.txt"
-            written = run.write_unverified(p)
-            note = f"{run.unverified_count:,} link(s) could not be verified (network/server errors)."
-            if written < run.unverified_count:
-                note += f" First {written:,} listed."
-            await send_text_file(bot, chat_id, p, note)
-
-        # Finish delivering the individual messages (the file already has everything).
-        await notifier.drain(stop_sending)
-        if notifier.failed:
-            logger.warning("%d link message(s) could not be delivered individually (they are in the results file)",
-                           len(notifier.failed))
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        logger.exception("Check session crashed")
-        try:
-            await bot.send_message(chat_id=chat_id, text="❌ Something went wrong while checking. See the bot log.")
-        except Exception:
-            pass
-    finally:
-        if ptask is not None:
-            ptask.cancel()
-        if notifier is not None:
-            await notifier.aclose()
-        state["run"] = None
-        state["run_kind"] = None
-        state["busy"] = False
-        if workdir is not None:
-            shutil.rmtree(workdir, ignore_errors=True)
-
-
-def _log_task_result(task: asyncio.Task):
-    if not task.cancelled() and task.exception():
-        logger.error("Background check task failed", exc_info=task.exception())
-
-
-def _start_background_check(context, chat_id: int, progress_msg, words_override=None):
-    task = asyncio.create_task(run_check_session(context.bot, chat_id, "manual", progress_msg, words_override))
-    task.add_done_callback(_log_task_result)
-    get_state(chat_id)["task"] = task      # keep a reference so it is never garbage-collected
-
-
-def _check_ready(state: dict, words=None) -> str | None:
-    """Return an error message if a check can't start, else None."""
-    words = state["words"] if words is None else words
-    if not words or not state["links"]:
-        return "⚠️ Please send both wordlist.txt and linklist.txt first. Use /help to see how."
-    total = checker.count_combinations(state["links"], words)
-    if total == 0:
-        return "⚠️ Nothing to check - your lists produce 0 links."
-    if total > MAX_COMBINATIONS:
-        return (f"⚠️ {total:,} combinations ({len(state['links']):,} links × {len(words):,} words) "
-                f"is more than the limit of {MAX_COMBINATIONS:,} per run.\n"
-                "Split your lists into smaller files, or raise MAX_COMBINATIONS in .env.")
+BASE_HEADERS = {"User-Agent": USER_AGENT, "Accept": "*/*"}
+# We only need the status code, so ask for a single byte. Servers that
+# support ranges answer 206 and the connection can be reused (fast).
+RANGE_HEADERS = {"Range": "bytes=0-0"}
+
+RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
+RANGE_UNSUPPORTED = frozenset({400, 405, 416, 501})
+
+# check outcomes
+NO, OK, RETRY, RANGE_BAD = 0, 1, 2, 3
+
+# Files with these endings must REALLY be images (checked by their first bytes).
+IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp")
+RANGE_HEAD = {"Range": "bytes=0-4095"}
+HEAD_BYTES = 4096
+
+
+def is_image_url(url: str) -> bool:
+    path = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return path.endswith(IMAGE_EXTS)
+
+
+def sniff_image(buf: bytes) -> str | None:
+    """Return the image type if the data really starts like an image, else None."""
+    if buf[:3] == b"\xff\xd8\xff":
+        return "JPEG"
+    if buf[:8] == b"\x89PNG\r\n\x1a\n":
+        return "PNG"
+    if buf[:6] in (b"GIF87a", b"GIF89a"):
+        return "GIF"
+    if buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+        return "WEBP"
     return None
 
 
 # ============================================================
-# COMMANDS
+# Lists + URL generation (shared by the bot and the workers)
 # ============================================================
 
-@restricted
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 <b>Welcome to Python Url Checker!</b>\n\n"
-        f"I check huge batches of links at high speed (up to {MAX_COMBINATIONS:,} link × word "
-        "combinations in one run) and tell you the instant a file really goes live — "
-        "with its image and the date it was uploaded.\n\n"
-        "<b>How it works</b>\n"
-        "1️⃣ Send me <code>wordlist.txt</code> — one word per line.\n"
-        "2️⃣ Send me <code>linklist.txt</code> — one link per line, with <code>(Word)</code> "
-        "where the word should go.\n"
-        "3️⃣ Send /check — every link is tested with every word, with live progress, speed and "
-        "time left. /cancel stops it any time.\n"
-        "4️⃣ Optional: <code>/autocheck 5</code> re-checks automatically every 5 minutes.\n\n"
-        "Quick tools: /addword (add + check new words instantly), /test (diagnose one link), "
-        "/found (everything found so far).\n\nType /help for all commands. 🚀"
-    )
-    await update.effective_message.reply_text(text, parse_mode=HTML)
+def read_lines(path) -> tuple[list[str], int]:
+    """Read a wordlist/linklist file.
 
-
-@restricted
-async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 <b>Python Url Checker — Help</b>\n\n"
-        "<b>Step 1 — upload two files</b> (send them as documents):\n"
-        "• <code>wordlist.txt</code> — one word per line\n"
-        "• <code>linklist.txt</code> — one link per line, e.g.\n"
-        "<code>https://example.com/img_(Word)_en.jpg</code>\n"
-        "Send a file again any time to replace it. Max file size: 20 MB.\n\n"
-        "<b>Checking</b>\n"
-        "/check — check every link with every word (live progress + time left)\n"
-        "/cancel — stop a running check (also works as /cancle)\n"
-        "/addword <code>Word1 Word2</code> — add words to your list and check ONLY those right away\n"
-        "/test <code>link</code> — see exactly what the server answers for one link\n\n"
-        "<b>Results</b>\n"
-        "/found — every working link found so far, newest first (<code>/found clear</code> empties it)\n\n"
-        "<b>Automatic checking</b>\n"
-        "/autocheck <code>N</code> — re-check every N minutes (1–10), status update every 30 min. "
-        "It resumes by itself after a restart.\n"
-        "/notify <code>all</code> | <code>new</code> — auto-check alerts: every time, or only for NEW links\n"
-        "/stopautocheck — stop it\n\n"
-        "<b>Other</b>\n"
-        "/status — what is loaded / running · /resetstats — clear counters · /id — this chat's ID\n"
-        "/allow, /disallow, /allowed — (admin) manage which chats and groups may use the bot\n\n"
-        f"Limit: {MAX_COMBINATIONS:,} combinations per run. A link only counts as working when a real "
-        "file is there. Network errors are retried, and anything that still can't be verified is "
-        "reported — nothing is silently skipped."
-    )
-    await update.effective_message.reply_text(text, parse_mode=HTML)
-
-
-async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Open to everyone - needed to find a group's ID before allowing it."""
-    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
-    if chat is None or msg is None:
-        return
-    text = (
-        f"Chat ID: <code>{chat.id}</code>\n"
-        f"Chat type: {escape(chat.type)}\n"
-        f"Your user ID: <code>{user.id if user else 'unknown'}</code>\n"
-        f"Allowed: {'yes ✅' if is_allowed(chat.id) else 'no ❌'}"
-    )
-    await msg.reply_text(text, parse_mode=HTML)
-
-
-async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
-    if chat is None or msg is None:
-        return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /allow.")
-        return
-    target = chat.id
-    if context.args:
-        try:
-            target = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /allow  (allow this chat)  or  /allow -1001234567890")
-            return
-    if is_allowed(target):
-        await msg.reply_text(f"Chat {target} is already allowed ✅")
-        return
-    dynamic_allowed.add(target)
-    _save_dynamic()
-    await msg.reply_text(f"✅ Chat {target} is now allowed to use this bot.")
-
-
-async def disallow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
-    if chat is None or msg is None:
-        return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /disallow.")
-        return
-    target = chat.id
-    if context.args:
-        try:
-            target = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /disallow  (this chat)  or  /disallow -1001234567890")
-            return
-    if target in ENV_ALLOWED:
-        await msg.reply_text("That chat is set in ALLOWED_CHAT_IDS (.env). Remove it there and restart the bot.")
-        return
-    if target not in dynamic_allowed:
-        await msg.reply_text("That chat wasn't added with /allow.")
-        return
-    dynamic_allowed.discard(target)
-    _save_dynamic()
-    await msg.reply_text(f"🗑 Chat {target} removed.")
-
-
-async def allowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user, msg = update.effective_user, update.effective_message
-    if msg is None:
-        return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /allowed.")
-        return
-    env_list = ", ".join(str(i) for i in sorted(ENV_ALLOWED)) or "none"
-    dyn_list = ", ".join(str(i) for i in sorted(dynamic_allowed)) or "none"
-    await msg.reply_text(f"From .env: {env_list}\nAdded with /allow: {dyn_list}")
-
-
-@restricted
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = get_state(chat_id)
-    total = checker.count_combinations(state["links"], state["words"])
-    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}")
-    auto = f"every {state['interval_minutes']} min ✅" if jobs else "off ❌"
-    last = (datetime.fromtimestamp(state["last_run_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            if state["last_run_time"] else "never")
-
-    lines = [
-        "📊 <b>Status</b>",
-        f"Words loaded: <code>{len(state['words']):,}</code>",
-        f"Link templates loaded: <code>{len(state['links']):,}</code>",
-        f"Total combinations: <code>{total:,}</code> (limit {MAX_COMBINATIONS:,})",
-        f"Auto-check: {auto} · alerts: <b>{state['notify_mode']}</b>",
-        f"Auto-check cycles completed: <code>{state['cycles_run']}</code>"
-        + (f" (skipped {state['skipped_cycles']} because a check was still running)" if state["skipped_cycles"] else ""),
-        f"Last check: {last} — checked <code>{state['last_run_checked']:,}</code>, "
-        f"working <code>{state['last_run_working']:,}</code>, "
-        f"unverified <code>{state['last_run_unverified']:,}</code>",
-        f"Working links in history: <code>{len(state['history']):,}</code> (see /found)",
-    ]
-    run = state["run"]
-    if run is not None and not run.finished:
-        s = run.snapshot()
-        eta = fmt_dur(s["eta"]) if s["eta"] is not None else "calculating"
-        lines.append(
-            f"⏳ Running now ({state['run_kind']}): {s['processed']:,}/{s['total']:,} "
-            f"({s['processed'] * 100 / max(1, s['total']):.1f}%), time left ~{eta}"
-        )
-    elif state["busy"]:
-        lines.append("⏳ A check is starting...")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=HTML)
-
-
-@restricted
-async def resetstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = get_state(update.effective_chat.id)
-    state.update(cycles_run=0, skipped_cycles=0, last_run_time=None,
-                 last_run_checked=0, last_run_working=0, last_run_unverified=0)
-    await update.effective_message.reply_text("🧹 Counters cleared. (Your found-links history is kept - use /found clear to empty it.)")
-
-
-@restricted
-async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-
-    if state["busy"]:
-        await msg.reply_text("⏳ A check is already running. Use /cancel to stop it first.")
-        return
-    problem = _check_ready(state)
-    if problem:
-        await msg.reply_text(problem)
-        return
-
-    total = checker.count_combinations(state["links"], state["words"])
-    state["busy"] = True
-    state["pending_cancel"] = False
+    Returns (clean_unique_lines, number_of_lines_skipped).
+    Handles UTF-8 BOM, Windows/Mac/Linux line endings, blank lines and
+    duplicates (order is preserved). A BOM at the start of a file used
+    to silently corrupt the FIRST word - that is handled here.
+    """
+    p = Path(path)
+    if not p.exists():
+        return [], 0
+    raw = p.read_bytes()
     try:
-        progress_msg = await msg.reply_text(
-            f"🚀 Starting: {len(state['links']):,} links × {len(state['words']):,} words = {total:,} combinations\n"
-            "Send /cancel to stop."
-        )
-    except Exception:
-        state["busy"] = False
-        raise
-    # Runs in the background so the bot stays responsive (this is what makes /cancel work).
-    _start_background_check(context, chat_id, progress_msg)
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    cleaned = []
+    for line in text.splitlines():
+        line = line.replace("\ufeff", "").replace("\u200b", "").strip()
+        if line:
+            cleaned.append(line)
+    unique = list(dict.fromkeys(cleaned))
+    skipped = len(text.splitlines()) - len(unique)
+    return unique, skipped
 
 
-@restricted
-async def addword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Add words to the list and immediately check ONLY those words against every link."""
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-
-    given = [w.strip() for w in context.args if w.strip()]
-    if not given:
-        await msg.reply_text("Usage: /addword Word1 Word2 Word3\n"
-                             "Adds the words to your wordlist and checks only those words against all your links.")
-        return
-    existing = set(state["words"])
-    new = [w for w in dict.fromkeys(given) if w not in existing]
-    if not new:
-        await msg.reply_text("Those word(s) are already in your wordlist. Use /check to check everything.")
-        return
-
-    state["words"] = state["words"] + new
-    (chat_dir(chat_id) / "wordlist.txt").write_text("\n".join(state["words"]) + "\n", encoding="utf-8")
-    shown = ", ".join(new[:10]) + (" ..." if len(new) > 10 else "")
-    text = f"✅ Added {len(new)} word(s): {shown}\nWords in list: {len(state['words']):,}"
-
-    if not state["links"]:
-        await msg.reply_text(text + "\nNow send linklist.txt, then /check.")
-        return
-    if state["busy"]:
-        await msg.reply_text(text + "\n⏳ A check is running - the new word(s) will be included in the next /check.")
-        return
-    problem = _check_ready(state, new)
-    if problem:
-        await msg.reply_text(text + "\n" + problem)
-        return
-
-    total = checker.count_combinations(state["links"], new)
-    state["busy"] = True
-    state["pending_cancel"] = False
-    try:
-        progress_msg = await msg.reply_text(
-            f"{text}\n🚀 Checking only the new word(s) with all {len(state['links']):,} links "
-            f"({total:,} combinations)...\nSend /cancel to stop."
-        )
-    except Exception:
-        state["busy"] = False
-        raise
-    _start_background_check(context, chat_id, progress_msg, words_override=new)
+def quote_word(word: str) -> str:
+    """Make a word safe to place inside a URL (letters, digits and _ - . ~
+    are left exactly as they are)."""
+    return quote(word, safe="-_.~")
 
 
-@restricted
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnose one link: what does the server really answer?"""
-    msg = update.effective_message
-    state = get_state(update.effective_chat.id)
-    if not context.args:
-        await msg.reply_text("Usage: /test https://example.com/path/image.jpg\n"
-                             "Shows exactly what the server answers for that link, and for a similar link "
-                             "that cannot exist - so you can see why a link is (not) counted as working.")
-        return
-    url = context.args[0].strip()
-    if checker.PLACEHOLDER_RE.search(url):
-        if not state["words"]:
-            await msg.reply_text("That link contains (Word). Send a real link, or upload your wordlist first.")
-            return
-        url = checker.PLACEHOLDER_RE.sub(lambda m: checker.quote_word(state["words"][0]), url)
-    if not url.lower().startswith(("http://", "https://")):
-        await msg.reply_text("Please send a full link starting with http:// or https://")
-        return
+def count_combinations(links: list[str], words: list[str]) -> int:
+    n = 0
+    for link in links:
+        n += len(words) if PLACEHOLDER_RE.search(link) else 1
+    return n
 
-    wait = await msg.reply_text("🔬 Testing the link...")
-    try:
-        res = await checker.inspect_url(url)
-    except Exception as e:
-        await wait.edit_text(f"❌ The test failed: {type(e).__name__}: {e}"[:500])
-        return
 
-    def block(label: str, info: dict) -> list[str]:
-        if info.get("error"):
-            return [f"{label}", f"  Error: {info['error']}"]
-        out = [label, f"  HTTP status: {info['status']}"]
-        if info["status"] in (200, 206):
-            out.append(f"  Content-Type: {info['ctype'] or 'not given'}")
-            if info.get("total"):
-                out.append(f"  Size: {fmt_size(info['total'])}")
-            out.append("  Real image: " + (f"yes ({info['kind']}) ✅" if info.get("kind") else "no ❌"))
-            out.append("  Last modified: " + (fmt_bd(info.get("lm")) or "not provided by the server"))
-        return out
-
-    main, ctrl = res["main"], res["control"]
-    lines = ["🔬 Test result", url, ""]
-    lines += block("This link:", main)
-    lines.append("")
-    lines.append(("✅ VERDICT: WORKING — " if res["ok"] else "❌ VERDICT: NOT working — ") + res["reason"])
-    lines.append("")
-    lines.append("Control (a link that certainly does not exist):")
-    lines.append("  " + (ctrl.get("url") or ""))
-    if ctrl.get("error"):
-        lines.append(f"  Error: {ctrl['error']}")
-    else:
-        lines.append(f"  HTTP status: {ctrl['status']}")
-        if ctrl["status"] in (200, 206):
-            lines.append("  ⚠️ The server ALSO returns a file for links that don't exist, so it can't be trusted "
-                         "on status code alone - the bot compares the file itself (done automatically).")
+def iter_urls(links: list[str], words: list[str]):
+    """Yield every link x word combination, lazily (no giant list)."""
+    qwords = [quote_word(w) for w in words]
+    for link in links:
+        if PLACEHOLDER_RE.search(link):
+            parts = PLACEHOLDER_RE.split(link)
+            for qw in qwords:
+                yield qw.join(parts)
         else:
-            lines.append("  ✅ The server correctly refuses missing files.")
-    await wait.edit_text("\n".join(lines)[:4000], link_preview_options=NO_PREVIEW)
+            yield link
 
 
-@restricted
-async def found_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-    hist = state["history"]
+# ============================================================
+# WORKER SIDE (runs inside "python checker.py --worker")
+# ============================================================
 
-    if context.args and context.args[0].lower() == "clear":
-        hist.clear()
-        save_history(chat_id)
-        await msg.reply_text("🧹 Found-links history cleared.")
-        return
-    if not hist:
-        await msg.reply_text("Nothing found yet. Working links appear here after a check finds them.")
-        return
+async def _get(session, url: str, headers):
+    """One request. Returns (outcome, status)."""
+    async with session.get(url, headers=headers, allow_redirects=True, max_redirects=5) as resp:
+        status = resp.status
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        clen = resp.headers.get("Content-Length")
+        clen_n = int(clen) if clen is not None and clen.isdigit() else None
 
-    ordered = sorted(hist.items(), key=lambda kv: (lm_epoch(kv[1].get("lm")), kv[1].get("first", 0)), reverse=True)
-    top = ordered[:10]
-    lines = [f"📚 {len(ordered):,} working link(s) found so far. Newest first:", ""]
-    for url, entry in top:
-        lines.append(url)
-        lines.append("   📅 " + (fmt_bd(entry.get("lm")) or "Last modified: not provided"))
-    if len(ordered) > len(top):
-        lines.append(f"\n...and {len(ordered) - len(top):,} more in the file below.")
-    await msg.reply_text("\n".join(lines), link_preview_options=NO_PREVIEW)
-
-    if len(ordered) > len(top):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / f"all_found_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            p.write_text("\n".join(result_lines([(u, e.get("lm")) for u, e in ordered])) + "\n", encoding="utf-8")
-            await send_text_file(context.bot, chat_id, p, f"All {len(ordered):,} working links found so far.")
-
-
-@restricted
-async def notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-    choice = context.args[0].lower() if context.args else ""
-    if choice not in ("all", "new"):
-        await msg.reply_text(
-            f"Auto-check alerts are set to: {state['notify_mode']}\n\n"
-            "/notify all — message me every time a working link is found, every cycle\n"
-            "/notify new — message me only for links I haven't been told about before")
-        return
-    state["notify_mode"] = choice
-    save_settings(chat_id)
-    await msg.reply_text("✅ Auto-check will alert you every time a working link is found." if choice == "all"
-                         else "✅ Auto-check will alert you only for NEW links (everything is still in /found).")
-
-
-@restricted
-async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = get_state(update.effective_chat.id)
-    msg = update.effective_message
-    run = state["run"]
-    if run is not None and not run.finished:
-        run.cancel()
-        extra = ""
-        if state["run_kind"] == "auto":
-            extra = " (auto-check stays on - use /stopautocheck to turn it off)"
-        await msg.reply_text("🛑 Cancelling..." + extra)
-    elif run is not None:
-        # checking is over; only the delivery of the individual messages is still going
-        state["stop_notify"] = True
-        await msg.reply_text("🛑 Stopped sending the remaining link messages. The results file has every working link.")
-    elif state["busy"]:
-        state["pending_cancel"] = True
-        await msg.reply_text("🛑 Cancelling...")
-    else:
-        await msg.reply_text("There's no check running right now.")
-
-
-# ---------------- automatic checking ----------------
-
-async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_id = context.job.chat_id
-    state = get_state(chat_id)
-    if state["busy"]:
-        state["skipped_cycles"] += 1          # previous check still running - never overlap
-        return
-    if _check_ready(state):
-        return
-    state["busy"] = True
-    state["pending_cancel"] = False
-    await run_check_session(context.bot, chat_id, "auto", None)
-
-
-async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
-    """Status update every 30 minutes while autocheck is on."""
-    chat_id = context.job.chat_id
-    state = get_state(chat_id)
-    last = (datetime.fromtimestamp(state["last_run_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            if state["last_run_time"] else "not yet")
-    lines = [
-        "📡 <b>Autocheck status update</b>",
-        f"Checking every: <code>{state['interval_minutes']}</code> min · alerts: <b>{state['notify_mode']}</b>",
-        f"Cycles completed: <code>{state['cycles_run']}</code>",
-        f"Last check: {last}",
-        f"Last check: <code>{state['last_run_checked']:,}</code> links, "
-        f"<code>{state['last_run_working']:,}</code> working, "
-        f"<code>{state['last_run_unverified']:,}</code> unverified",
-        f"Working links in history: <code>{len(state['history']):,}</code>",
-    ]
-    run = state["run"]
-    if run is not None and not run.finished:
-        s = run.snapshot()
-        eta = fmt_dur(s["eta"]) if s["eta"] is not None else "calculating"
-        lines.append(
-            f"⏳ Current cycle: {s['processed']:,}/{s['total']:,} "
-            f"({s['processed'] * 100 / max(1, s['total']):.1f}%), time left ~{eta}, "
-            f"working found so far {s['found']:,}"
-        )
-    else:
-        lines.append("Current cycle: waiting for the next run")
-    lines.append("Still running ✅")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=HTML)
-
-
-def schedule_autocheck(job_queue, chat_id: int, minutes: int, first: int = 5):
-    for name in (f"check-{chat_id}", f"heartbeat-{chat_id}"):
-        for job in job_queue.get_jobs_by_name(name):
-            job.schedule_removal()
-    job_queue.run_repeating(autocheck_job, interval=minutes * 60, first=first,
-                            chat_id=chat_id, name=f"check-{chat_id}")
-    job_queue.run_repeating(heartbeat_job, interval=HEARTBEAT_SECONDS, first=HEARTBEAT_SECONDS,
-                            chat_id=chat_id, name=f"heartbeat-{chat_id}")
-
-
-@restricted
-async def autocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-
-    if not context.args:
-        await msg.reply_text(
-            f"Usage: /autocheck N   (N = minutes, {MIN_AUTOCHECK_MINUTES} to {MAX_AUTOCHECK_MINUTES})\n"
-            "Example: /autocheck 5"
-        )
-        return
-    try:
-        minutes = int(context.args[0])
-    except ValueError:
-        await msg.reply_text("Please give a whole number of minutes, e.g. /autocheck 5")
-        return
-    if not (MIN_AUTOCHECK_MINUTES <= minutes <= MAX_AUTOCHECK_MINUTES):
-        await msg.reply_text(f"⏱ Please choose between {MIN_AUTOCHECK_MINUTES} and {MAX_AUTOCHECK_MINUTES} minutes.")
-        return
-    problem = _check_ready(state)
-    if problem:
-        await msg.reply_text(problem)
-        return
-
-    state["interval_minutes"] = minutes
-    state["cycles_run"] = 0
-    state["skipped_cycles"] = 0
-    save_settings(chat_id)
-    schedule_autocheck(context.job_queue, chat_id, minutes)
-    mode_note = ("every working link every cycle" if state["notify_mode"] == "all"
-                 else "only NEW links (change with /notify all)")
-    await msg.reply_text(
-        f"✅ Auto-check enabled: every {minutes} minute(s) I re-check every link with every word.\n"
-        f"Alerts: {mode_note}. Status update every 30 minutes. It resumes by itself if the bot restarts.\n"
-        "If a check takes longer than the interval, the next one waits (checks never overlap)."
-    )
-
-
-@restricted
-async def stopautocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = get_state(chat_id)
-    msg = update.effective_message
-    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}") + \
-        context.job_queue.get_jobs_by_name(f"heartbeat-{chat_id}")
-    if not jobs and not state["interval_minutes"]:
-        await msg.reply_text("Auto-check isn't running right now.")
-        return
-    for job in jobs:
-        job.schedule_removal()
-    state["interval_minutes"] = None
-    save_settings(chat_id)
-    run = state["run"]
-    if run is not None and not run.finished and state["run_kind"] == "auto":
-        run.cancel()
-    await msg.reply_text("🛑 Auto-check and status updates stopped.")
-
-
-# ---------------- uploads ----------------
-
-async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, msg = update.effective_chat, update.effective_message
-    if chat is None or msg is None or msg.document is None or not is_allowed(chat.id):
-        return  # stay silent in chats that are not allowed
-    doc = msg.document
-    name = (doc.file_name or "").lower()
-    kind = "words" if "wordlist" in name else "links" if "linklist" in name else None
-    if kind is None:
-        if chat.type == "private":
-            await msg.reply_text("📄 Please send files named wordlist.txt and linklist.txt.")
-        return
-    if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
-        await msg.reply_text("⚠️ That file is bigger than 20 MB, which is Telegram's limit for bots. "
-                             "Please split it into smaller files.")
-        return
-
-    state = get_state(chat.id)
-    filename = "wordlist.txt" if kind == "words" else "linklist.txt"
-    dest = chat_dir(chat.id) / filename
-    try:
-        tg_file = await doc.get_file()
-        await tg_file.download_to_drive(custom_path=dest)
-        items, skipped = await asyncio.to_thread(checker.read_lines, dest)
-    except Exception:
-        logger.exception("Could not read uploaded file")
-        await msg.reply_text("❌ I couldn't download or read that file. Please try sending it again.")
-        return
-
-    state[kind] = items
-    label = "word(s)" if kind == "words" else "link(s)"
-    text = f"✅ Loaded {len(items):,} {label} from {filename}"
-    if skipped:
-        text += f" ({skipped:,} blank/duplicate line(s) skipped)"
-    if kind == "links" and items and not any(checker.PLACEHOLDER_RE.search(x) for x in items):
-        text += "\n⚠️ None of your links contain (Word) - each link will just be checked once."
-    await msg.reply_text(text)
-
-    if state["words"] and state["links"]:
-        total = checker.count_combinations(state["links"], state["words"])
-        note = f"Both files loaded: {len(state['links']):,} links × {len(state['words']):,} words = {total:,} combinations."
-        if total > MAX_COMBINATIONS:
-            note += f"\n⚠️ That is more than the limit of {MAX_COMBINATIONS:,} per run."
+        if status in (200, 206):
+            # Some CDNs answer a missing file with a 200 "not found" web page.
+            outcome = NO if ctype.startswith("text/html") else OK
+        elif status in RETRY_STATUSES:
+            outcome = RETRY
+        elif headers is not None and status in RANGE_UNSUPPORTED:
+            outcome = RANGE_BAD
         else:
-            note += "\nSend /check when you're ready! 🚀"
-        await msg.reply_text(note)
+            outcome = NO
+
+        # Read small bodies completely so the keep-alive connection can be
+        # reused for the next URL (this is a big part of the speed).
+        if outcome == OK:
+            drain = clen_n is not None and clen_n <= 65536
+        else:
+            drain = clen_n is None or clen_n <= 1_000_000
+        if drain:
+            try:
+                await resp.read()
+            except Exception:
+                pass
+        return outcome, status
 
 
-async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, msg = update.effective_chat, update.effective_message
-    if chat and msg and chat.type == "private" and is_allowed(chat.id):
-        await msg.reply_text("Not sure what you mean - try /help.")
+async def _probe(session, url: str, st) -> int:
+    try:
+        outcome, status = await _get(session, url, RANGE_HEADERS)
+        if outcome == RANGE_BAD:  # server doesn't like Range -> plain GET
+            outcome, status = await _get(session, url, None)
+            if outcome == RANGE_BAD:
+                outcome = NO
+        if status == 429:  # server asks us to slow down -> brief global pause
+            st.cooldown_until = max(st.cooldown_until, time.monotonic() + 1.0 + random.random())
+        return outcome
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
+        return NO
+    except Exception:
+        # timeout, connection reset, DNS hiccup, ... -> NOT "not found"
+        return RETRY
 
 
-# ============================================================
-# STARTUP / SHUTDOWN
-# ============================================================
+def _total_size(resp) -> int | None:
+    cr = resp.headers.get("Content-Range")
+    if cr and "/" in cr:
+        tail = cr.rsplit("/", 1)[1].strip()
+        if tail.isdigit():
+            return int(tail)
+    cl = resp.headers.get("Content-Length")
+    if resp.status == 200 and cl and cl.isdigit():
+        return int(cl)
+    return None
 
-async def restore_autocheck(app: Application):
-    """After a restart, switch auto-check back on for chats that had it on."""
-    for d in DATA_DIR.iterdir():
-        name = d.name
-        if not d.is_dir() or not name.lstrip("-").isdigit():
-            continue
-        chat_id = int(name)
-        if not is_allowed(chat_id):
-            continue
-        state = get_state(chat_id)
-        minutes = state["interval_minutes"]
-        if not isinstance(minutes, int) or not (MIN_AUTOCHECK_MINUTES <= minutes <= MAX_AUTOCHECK_MINUTES):
-            continue
-        if _check_ready(state):
-            continue
-        schedule_autocheck(app.job_queue, chat_id, minutes, first=15)
+
+async def _fetch_head(session, url: str) -> dict:
+    """GET the first 4 KB of a file. Returns status, headers we care about
+    and the first bytes (used to prove it is a real image)."""
+    for headers in (RANGE_HEAD, None):
+        async with session.get(url, headers=headers, allow_redirects=True, max_redirects=5) as resp:
+            status = resp.status
+            if headers is not None and status in RANGE_UNSUPPORTED:
+                continue  # server dislikes Range -> ask again without it
+            info = {
+                "status": status,
+                "ctype": (resp.headers.get("Content-Type") or "").lower(),
+                "lm": resp.headers.get("Last-Modified"),
+                "total": _total_size(resp),
+                "head": b"",
+                "final": str(resp.url),
+            }
+            if status in (200, 206):
+                buf = bytearray()
+                while len(buf) < HEAD_BYTES:
+                    chunk = await resp.content.read(HEAD_BYTES - len(buf))
+                    if not chunk:
+                        break
+                    buf += chunk
+                info["head"] = bytes(buf)
+            return info
+    return {"status": 0, "ctype": "", "lm": None, "total": None, "head": b"", "final": url}
+
+
+def _fingerprint(info: dict) -> tuple:
+    return (info["total"], hashlib.md5(info["head"]).hexdigest())
+
+
+async def _verify(session, url: str, st):
+    """Second, strict step for anything that looked like a hit.
+
+    A link only counts as WORKING when:
+      * the server answered 200/206, and it is not a web page, and
+      * for .jpg/.png/.gif/.webp links the file REALLY starts like an image, and
+      * it is NOT identical to what the server returns for a link that
+        certainly does not exist (servers that answer every link with a
+        placeholder picture / error page).
+    Returns (outcome, meta).
+    """
+    info = await _fetch_head(session, url)
+    status = info["status"]
+    if status in RETRY_STATUSES:
+        if status == 429:
+            st.cooldown_until = max(st.cooldown_until, time.monotonic() + 1.0 + random.random())
+        return RETRY, None
+    if status not in (200, 206):
+        return NO, None
+    if info["ctype"].startswith("text/html"):
+        return NO, None
+    kind = None
+    if is_image_url(url):
+        kind = sniff_image(info["head"])
+        if kind is None:
+            return NO, None
+    if _fingerprint(info) in st.baseline:
+        return NO, None
+    return OK, {"lm": info["lm"], "sz": info["total"], "ct": info["ctype"], "kind": kind}
+
+
+async def _learn_baseline(session, links: list[str], st):
+    """Ask each link pattern for a word that certainly doesn't exist and remember
+    what the server answers. If it answers with a file (placeholder image / page),
+    real hits are later told apart from it."""
+    templates = [l for l in links if PLACEHOLDER_RE.search(l)][:300]
+    if not templates:
+        return
+    sem = asyncio.Semaphore(20)
+
+    async def one(tmpl: str, junk: str):
+        url = junk.join(PLACEHOLDER_RE.split(tmpl))
+        async with sem:
+            for attempt in range(3):
+                try:
+                    info = await _fetch_head(session, url)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.sleep(0.3 * (attempt + 1))
+                    continue
+                if info["status"] in (200, 206):
+                    st.baseline.add(_fingerprint(info))
+                    st.soft404 = True
+                elif info["status"] in RETRY_STATUSES:
+                    await asyncio.sleep(0.5)
+                    continue
+                return
+
+    junks = ["zqx" + os.urandom(4).hex() + "k", "qwv" + os.urandom(4).hex() + "m"]
+    await asyncio.gather(*(one(t, j) for t in templates for j in junks))
+
+
+async def _check(session, url: str, attempts: int, base_delay: float, st, honor_abort: bool = True):
+    """Check one URL, retrying network-type failures.
+    Returns (outcome, meta); outcome is NO / OK / RETRY (RETRY = could not verify)."""
+    for attempt in range(attempts):
+        wait = st.cooldown_until - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        meta = None
         try:
-            await app.bot.send_message(chat_id=chat_id, text=f"♻️ Auto-check resumed after the restart: every {minutes} minute(s).")
+            outcome = await _probe(session, url, st)       # step 1: cheap look
+            if outcome == OK:
+                outcome, meta = await _verify(session, url, st)   # step 2: strict proof
+        except asyncio.CancelledError:
+            raise
+        except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
+            return NO, None
         except Exception:
-            logger.info("Could not tell chat %s that auto-check resumed", chat_id)
+            outcome = RETRY
+        if outcome != RETRY:
+            st.consec = 0
+            return outcome, meta
+        st.consec += 1
+        st.errors += 1
+        if honor_abort and st.consec >= st.abort_after:
+            st.abort = True
+            return RETRY, None
+        if attempt + 1 < attempts:
+            await asyncio.sleep(base_delay * (2 ** attempt) * (0.5 + random.random()))
+    return RETRY, None
 
 
-async def post_init(app: Application):
+class _Out:
+    """Buffered JSON-lines writer to stdout (parent process reads it)."""
+
+    def __init__(self):
+        self.buf: list[str] = []
+
+    def emit(self, obj: dict):
+        self.buf.append(json.dumps(obj, separators=(",", ":")))
+
+    def flush(self):
+        if not self.buf:
+            return
+        data = "\n".join(self.buf) + "\n"
+        self.buf.clear()
+        try:
+            sys.stdout.write(data)
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            os._exit(1)  # parent is gone -> stop
+
+
+def _watch_stdin(loop, ev: asyncio.Event):
+    """Parent sends a line (or closes the pipe) to ask us to stop."""
     try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "Welcome message"),
-            BotCommand("help", "How to use the bot"),
-            BotCommand("check", "Check all links with all words"),
-            BotCommand("cancel", "Cancel the running check"),
-            BotCommand("addword", "Add words and check only those"),
-            BotCommand("test", "Diagnose one link"),
-            BotCommand("found", "All working links found so far"),
-            BotCommand("autocheck", "Re-check automatically (1-10 min)"),
-            BotCommand("notify", "Auto-check alerts: all or new"),
-            BotCommand("stopautocheck", "Stop automatic checking"),
-            BotCommand("status", "Show status"),
-            BotCommand("id", "Show this chat's ID"),
-        ])
+        sys.stdin.readline()
     except Exception:
-        logger.warning("Could not set the command menu", exc_info=True)
+        pass
     try:
-        await restore_autocheck(app)
-    except Exception:
-        logger.warning("Could not restore auto-check", exc_info=True)
+        loop.call_soon_threadsafe(ev.set)
+    except RuntimeError:
+        pass
 
 
-async def post_stop(app: Application):
-    # Make sure no checker worker process is left running.
-    for state in chat_state.values():
-        run = state.get("run")
-        if run is not None:
-            run.shutdown()
-
-
-def main():
-    if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is not set. Put it in a .env file or as an environment variable.\n"
-                         "Get a token from @BotFather on Telegram.")
-    if not ENV_ALLOWED and not dynamic_allowed:
-        logger.warning("ALLOWED_CHAT_IDS is empty - nobody can use the bot until you set it.")
-
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)          # lets /cancel, /status ... work while a check runs
-        .read_timeout(30).write_timeout(60).connect_timeout(15).pool_timeout(30)
-        .post_init(post_init)
-        .post_stop(post_stop)
-        .build()
+async def _shard(cfg: dict):
+    idx, nprocs = cfg["idx"], cfg["nprocs"]
+    conc, attempts = cfg["concurrency"], cfg["attempts"]
+    out = _Out()
+    st = SimpleNamespace(
+        processed=0, errors=0, consec=0, abort=False, cooldown_until=0.0,
+        abort_after=cfg["abort_after"], phase="main", pending_retry=0,
+        baseline=set(), soft404=False,
     )
+    # This worker's share: every nprocs-th URL, starting at idx.
+    urls = itertools.islice(iter_urls(cfg["links"], cfg["words"]), idx, None, nprocs)
+    deferred: list[str] = []
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("check", check_cmd))
-    app.add_handler(CommandHandler(["cancel", "cancle"], cancel_cmd))
-    app.add_handler(CommandHandler("addword", addword_cmd))
-    app.add_handler(CommandHandler("test", test_cmd))
-    app.add_handler(CommandHandler("found", found_cmd))
-    app.add_handler(CommandHandler("autocheck", autocheck_cmd))
-    app.add_handler(CommandHandler("stopautocheck", stopautocheck_cmd))
-    app.add_handler(CommandHandler("notify", notify_cmd))
-    app.add_handler(CommandHandler("resetstats", resetstats_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler("disallow", disallow_cmd))
-    app.add_handler(CommandHandler("allowed", allowed_cmd))
-    app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_text))
+    loop = asyncio.get_running_loop()
+    cancel_ev = asyncio.Event()
+    threading.Thread(target=_watch_stdin, args=(loop, cancel_ev), daemon=True).start()
 
-    logger.info("Python Url Checker bot is starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    connector = aiohttp.TCPConnector(
+        limit=conc, limit_per_host=0, ttl_dns_cache=600, ssl=False, force_close=False,
+    )
+    timeout = aiohttp.ClientTimeout(total=cfg["total_timeout"], connect=cfg["connect_timeout"])
+
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=timeout, headers=BASE_HEADERS,
+        cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
+    ) as session:
+
+        await _learn_baseline(session, cfg["links"], st)
+
+        async def first_pass_worker():
+            while not st.abort:
+                try:
+                    url = next(urls)
+                except StopIteration:
+                    return
+                r, meta = await _check(session, url, attempts, 0.25, st)
+                st.processed += 1
+                if r == OK:
+                    out.emit({"t": "f", "u": url, "m": meta})
+                elif r == RETRY:
+                    deferred.append(url)
+
+        async def retry_round(items: list[str], conc2: int, attempts2: int) -> list[str]:
+            it = iter(items)
+            still: list[str] = []
+
+            async def w():
+                while True:
+                    try:
+                        url = next(it)
+                    except StopIteration:
+                        return
+                    r, meta = await _check(session, url, attempts2, 0.5, st, honor_abort=False)
+                    if r == OK:
+                        out.emit({"t": "f", "u": url, "m": meta})
+                    if r == RETRY:
+                        still.append(url)
+                    st.pending_retry -= 1
+
+            await asyncio.gather(*(w() for _ in range(conc2)))
+            return still
+
+        async def run_all():
+            await asyncio.gather(*(first_pass_worker() for _ in range(conc)))
+            if st.abort:
+                return
+            for rnd in range(cfg["final_rounds"]):
+                if not deferred:
+                    break
+                st.phase = "retry"
+                await asyncio.sleep(2.0 * (rnd + 1))  # let the network/server cool down
+                items = deferred[:]
+                deferred.clear()
+                st.pending_retry = len(items)
+                still = await retry_round(items, max(10, conc // 5), attempts + 2)
+                deferred.extend(still)
+                st.pending_retry = len(deferred)
+
+        async def reporter():
+            while True:
+                pending = len(deferred) if st.phase == "main" else st.pending_retry
+                out.emit({"t": "p", "i": idx, "n": st.processed, "r": pending, "e": st.errors, "ph": st.phase})
+                out.flush()
+                await asyncio.sleep(0.25)
+
+        rep = asyncio.create_task(reporter())
+        main_task = asyncio.create_task(run_all())
+        cancel_task = asyncio.create_task(cancel_ev.wait())
+
+        cancelled = False
+        done, _ = await asyncio.wait({main_task, cancel_task}, return_when=asyncio.FIRST_COMPLETED)
+        if main_task not in done:
+            cancelled = True
+            main_task.cancel()
+            await asyncio.gather(main_task, return_exceptions=True)
+        else:
+            cancel_task.cancel()
+            main_task.result()  # re-raise unexpected errors
+        rep.cancel()
+        await asyncio.gather(rep, cancel_task, return_exceptions=True)
+
+    unverified = list(deferred)
+    if st.abort:
+        unverified.extend(urls)  # everything not even attempted
+
+    unv_file = None
+    if unverified and cfg.get("outdir") and not cancelled:
+        unv_file = str(Path(cfg["outdir"]) / f"unverified_{idx}.txt")
+        Path(unv_file).write_text("\n".join(unverified) + "\n", encoding="utf-8")
+
+    out.emit({
+        "t": "d", "i": idx, "n": st.processed, "e": st.errors,
+        "unv": 0 if cancelled else len(unverified), "unv_file": unv_file,
+        "abort": st.abort, "cancel": cancelled, "soft": st.soft404,
+    })
+    out.flush()
+
+
+def _run_loop(coro_factory):
+    try:
+        import uvloop  # optional, 2x faster event loop
+        if hasattr(uvloop, "run"):
+            return uvloop.run(coro_factory())
+        uvloop.install()
+    except ImportError:
+        pass
+    return asyncio.run(coro_factory())
+
+
+def worker_main():
+    try:
+        import resource  # Unix only: allow many open sockets
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = hard if hard != resource.RLIM_INFINITY else 65535
+        resource.setrlimit(resource.RLIMIT_NOFILE, (max(soft, min(want, 65535)), hard))
+    except Exception:
+        pass
+
+    cfg = json.loads(sys.stdin.readline())
+    try:
+        _run_loop(lambda: _shard(cfg))
+    except BaseException as e:  # report instead of dying silently
+        try:
+            sys.stdout.write(json.dumps({"t": "x", "msg": repr(e)}) + "\n")
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(1)
+    # os._exit: a daemon thread may still be blocked reading stdin.
+    sys.stdout.flush()
+    os._exit(0)
+
+
+# ============================================================
+# PARENT SIDE (used by bot.py)
+# ============================================================
+
+class CheckRun:
+    """One full check of every link x every word, spread over worker processes."""
+
+    def __init__(
+        self,
+        links: list[str],
+        words: list[str],
+        *,
+        workdir: str | Path,
+        processes: int | None = None,
+        concurrency: int = 600,
+        connect_timeout: float = 8.0,
+        total_timeout: float = 15.0,
+        attempts: int = 3,
+        final_rounds: int = 3,
+        abort_after: int = 1500,
+        small_run: int = 5000,
+    ):
+        self.links, self.words = links, words
+        self.total = count_combinations(links, words)
+        self.workdir = Path(workdir)
+        self.processes = processes or max(1, min(os.cpu_count() or 1, 4))
+        self.concurrency = concurrency
+        self.opts = dict(
+            connect_timeout=connect_timeout, total_timeout=total_timeout,
+            attempts=attempts, final_rounds=final_rounds, abort_after=abort_after,
+        )
+        self.small_run = small_run
+
+        self.found: list[str] = []
+        self.found_meta: dict[str, dict] = {}
+        self.soft404 = False
+        self.shards: dict[int, dict] = {}
+        self.unverified_count = 0
+        self.unverified_files: list[str] = []
+        self.errors: list[str] = []
+        self.crashed: list[int] = []
+        self.aborted = False
+        self.cancelled = False
+        self.finished = False
+        self.nprocs = 0
+        self.started: float | None = None
+        self.finished_at: float | None = None
+
+        self._procs: list = []
+        self._samples: deque = deque()
+        self._on_found = None
+        self._kill_timer = None
+
+    # ---------- progress ----------
+    @property
+    def processed(self) -> int:
+        return sum(s["n"] for s in self.shards.values())
+
+    @property
+    def suspicious(self) -> bool:
+        """True when an abnormal share of links look "working" - real hits are rare."""
+        return self.processed >= 300 and len(self.found) > 0.25 * self.processed
+
+    def elapsed(self) -> float:
+        if self.started is None:
+            return 0.0
+        return (self.finished_at or time.monotonic()) - self.started
+
+    def snapshot(self) -> dict:
+        now = time.monotonic()
+        processed = self.processed
+        retrying = sum(s["r"] for s in self.shards.values())
+        errors = sum(s.get("e", 0) for s in self.shards.values())
+
+        self._samples.append((now, processed))
+        while len(self._samples) > 2 and now - self._samples[0][0] > 30:
+            self._samples.popleft()
+        t0, p0 = self._samples[0]
+        if now - t0 >= 2 and processed > p0:
+            speed = (processed - p0) / (now - t0)          # recent speed
+        else:
+            el = self.elapsed()
+            speed = processed / el if el > 0 else 0.0     # average so far
+
+        remaining = max(0, self.total - processed)
+        eta = remaining / speed if speed > 0 and remaining > 0 else None
+        in_retry = processed >= self.total and retrying > 0
+        return {
+            "total": self.total, "processed": processed, "found": len(self.found),
+            "retrying": retrying, "errors": errors, "speed": speed, "eta": eta,
+            "elapsed": self.elapsed(), "in_retry": in_retry, "processes": self.nprocs,
+        }
+
+    # ---------- control ----------
+    def cancel(self):
+        """Ask all workers to stop (they flush what they found, then exit)."""
+        if self.cancelled or self.finished:
+            return
+        self.cancelled = True
+        self._send_cancel()
+        try:
+            self._kill_timer = asyncio.get_running_loop().call_later(8, self.shutdown)
+        except RuntimeError:
+            pass
+
+    def _send_cancel(self):
+        for p in self._procs:
+            try:
+                p.stdin.write(b"cancel\n")
+            except Exception:
+                pass
+
+    def shutdown(self):
+        """Hard-stop every worker right now."""
+        for p in self._procs:
+            if p.returncode is None:
+                try:
+                    p.terminate()
+                except Exception:
+                    pass
+
+    # ---------- running ----------
+    async def run(self, on_found=None):
+        self._on_found = on_found
+        self.started = time.monotonic()
+        try:
+            if self.total == 0:
+                return
+            self.nprocs = 1 if self.total < self.small_run else max(1, min(self.processes, self.total))
+            per_conc = max(10, self.concurrency // self.nprocs)
+            self.workdir.mkdir(parents=True, exist_ok=True)
+
+            for i in range(self.nprocs):
+                cfg = dict(self.opts, idx=i, nprocs=self.nprocs, concurrency=per_conc,
+                           links=self.links, words=self.words, outdir=str(self.workdir))
+                proc = await asyncio.create_subprocess_exec(
+                    sys.executable, str(CHECKER_PATH), "--worker",
+                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                    limit=4 * 1024 * 1024,
+                )
+                self._procs.append(proc)
+                self.shards[i] = {"n": 0, "r": 0, "e": 0, "done": False}
+                proc.stdin.write((json.dumps(cfg) + "\n").encode("ascii"))
+                await proc.stdin.drain()
+                if self.cancelled:
+                    break
+
+            if self.cancelled:
+                self._send_cancel()
+
+            await asyncio.gather(*(self._reader(i, p) for i, p in enumerate(self._procs)))
+        finally:
+            if self._kill_timer is not None:
+                self._kill_timer.cancel()
+            for p in self._procs:
+                try:
+                    if p.stdin and not p.stdin.is_closing():
+                        p.stdin.close()
+                except Exception:
+                    pass
+            self.shutdown()
+            for p in self._procs:
+                try:
+                    await asyncio.wait_for(p.wait(), 5)
+                except Exception:
+                    pass
+            self.finished_at = time.monotonic()
+            self.finished = True
+
+    async def _reader(self, i: int, proc):
+        got_done = False
+        try:
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                if self._handle(i, msg):
+                    got_done = True
+        except Exception as e:
+            self.errors.append(f"reader {i}: {e!r}")
+        finally:
+            try:
+                await asyncio.wait_for(proc.wait(), 10)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if not got_done and not self.cancelled:
+                self.crashed.append(i)
+
+    def _handle(self, i: int, msg: dict) -> bool:
+        t = msg.get("t")
+        sh = self.shards[i]
+        if t == "f":
+            url = msg["u"]
+            meta = msg.get("m") or {}
+            self.found.append(url)
+            self.found_meta[url] = meta
+            if self._on_found:
+                try:
+                    self._on_found(url, meta)
+                except Exception:
+                    pass
+        elif t == "p":
+            sh["n"], sh["r"], sh["e"] = msg["n"], msg["r"], msg.get("e", 0)
+        elif t == "d":
+            sh.update(n=msg["n"], r=0, e=msg.get("e", 0), done=True)
+            self.unverified_count += msg.get("unv", 0)
+            if msg.get("unv_file"):
+                self.unverified_files.append(msg["unv_file"])
+            if msg.get("abort"):
+                self.aborted = True
+            if msg.get("soft"):
+                self.soft404 = True
+            return True
+        elif t == "x":
+            self.errors.append(str(msg.get("msg")))
+        return False
+
+    def write_unverified(self, dest: str | Path, limit: int = 200_000) -> int:
+        """Merge the workers' unverified lists into one file. Returns lines written."""
+        written = 0
+        with open(dest, "w", encoding="utf-8") as out:
+            for f in self.unverified_files:
+                try:
+                    with open(f, encoding="utf-8") as src:
+                        for line in src:
+                            if written >= limit:
+                                return written
+                            out.write(line)
+                            written += 1
+                except OSError:
+                    pass
+        return written
+
+
+
+# ============================================================
+# SINGLE LINK DIAGNOSIS (used by /test)
+# ============================================================
+
+def control_url(url: str) -> str:
+    """The same link with its file name changed so it certainly doesn't exist."""
+    base = url.split("?", 1)[0].split("#", 1)[0]
+    name = base.rsplit("/", 1)[-1]
+    stem, dot, ext = name.rpartition(".")
+    new = (stem + "_zqx0k9" + dot + ext) if dot else (name + "_zqx0k9")
+    return base[: len(base) - len(name)] + new
+
+
+async def _inspect_one(session, url: str) -> dict:
+    try:
+        info = await _fetch_head(session, url)
+    except Exception as e:
+        return {"url": url, "error": f"{type(e).__name__}: {e}"[:200]}
+    info["url"] = url
+    good = info["status"] in (200, 206)
+    info["kind"] = sniff_image(info["head"]) if good else None
+    info["fp"] = _fingerprint(info) if good else None
+    return info
+
+
+def judge(url: str, main: dict, ctrl: dict | None) -> tuple[bool, str]:
+    """Same rules as the real check. Returns (is_working, reason)."""
+    if main.get("error"):
+        return False, f"the request failed ({main['error']})"
+    status = main["status"]
+    if status in RETRY_STATUSES:
+        return False, f"the server answered HTTP {status} (temporary error - try again)"
+    if status not in (200, 206):
+        return False, f"the server answered HTTP {status}"
+    if main["ctype"].startswith("text/html"):
+        return False, "it is a web page, not a file"
+    if is_image_url(url) and main["kind"] is None:
+        return False, "the content is not a real image"
+    if ctrl and not ctrl.get("error") and ctrl.get("fp") is not None and ctrl["fp"] == main["fp"]:
+        return False, "it is identical to what the server returns for a link that does not exist (a placeholder)"
+    return True, "real image" if main["kind"] else "the file exists"
+
+
+async def inspect_url(url: str, timeout: float = 20.0) -> dict:
+    connector = aiohttp.TCPConnector(ssl=False)
+    async with aiohttp.ClientSession(
+        connector=connector, timeout=aiohttp.ClientTimeout(total=timeout), headers=BASE_HEADERS,
+        cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
+    ) as session:
+        main = await _inspect_one(session, url)
+        ctrl = await _inspect_one(session, control_url(url))
+    ok, reason = judge(url, main, ctrl)
+    return {"main": main, "control": ctrl, "ok": ok, "reason": reason}
 
 
 if __name__ == "__main__":
-    main()
+    if "--worker" in sys.argv:
+        worker_main()
+    else:
+        print("This file is the checking engine used by bot.py. Run bot.py instead.")

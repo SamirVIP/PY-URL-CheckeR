@@ -99,7 +99,7 @@ def _parse_ids(text: str) -> set[int]:
     return ids
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGkwwoRzvAz9Y3Zcan_JtLKxyeNEm8gS_M").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGcwAbCTejwyYzpEm15LxyoNh2rsS7OGNA").strip()
 
 # Chats (private chats AND groups) that may use the bot. Group IDs are
 # negative numbers like -1001234567890.

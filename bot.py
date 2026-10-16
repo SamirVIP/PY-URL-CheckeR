@@ -2,34 +2,19 @@
 Python Url Checker - Telegram Bot
 ==================================
 
-Send the bot two files:
-  wordlist.txt  - one word per line
-  linklist.txt  - one link per line, with (Word) where the word goes
+Send the bot two files (wordlist.txt, linklist.txt) and /check tests EVERY link with
+EVERY word - up to 1,000,000 combinations per run - and sends each working link with
+its picture and "Last modified" date in the user's own country time.
 
-/check tests EVERY link with EVERY word (up to 600,000 combinations per
-run) using the multi-process engine in checker.py. A link only counts as
-working when the file is REALLY there (real image bytes, not a
-placeholder the server returns for everything). Every working link is
-sent with its image and its "Last modified" date in Bangladesh time.
+Who can use it
+--------------
+* Admins (ADMIN_IDS / personal IDs in ALLOWED_CHAT_IDS) can do everything.
+* Everyone else needs the admin's approval first. The admin can give a user ALL
+  commands, or only some of them (for example only /test).
+* Every user chooses a country on first /start; all times are shown in that time zone.
+* Statistics reset every day at 04:00 AM Bangladesh time (shown in each user's time).
 
-Commands
---------
-/start            welcome
-/help             help
-/check            check everything now (live progress + time left)
-/cancel           stop a running check (alias: /cancle)
-/addword W1 W2    add words to your list AND instantly check only those
-/test LINK        diagnose one link (what does the server really answer?)
-/found            every working link found so far (newest first)
-/autocheck N      re-check automatically every N minutes (1-10)
-/stopautocheck    stop automatic checking
-/notify all|new   auto-check alerts: every time, or only NEW links
-/status           what is loaded / running
-/resetstats       clear the counters
-/id               show this chat's ID (use it to allow a group)
-/allow [id]       (admin) allow this chat or the given chat ID
-/disallow [id]    (admin) remove a chat added with /allow
-/allowed          (admin) list allowed chats
+Run:  python bot.py   (see README.md)
 """
 
 from __future__ import annotations
@@ -38,22 +23,30 @@ import asyncio
 import json
 import logging
 import os
+import secrets
 import shutil
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from collections import OrderedDict
+from datetime import datetime, time as dtime, timezone
 from functools import wraps
-from html import escape
 from pathlib import Path
 
 import aiohttp
-from telegram import BotCommand, LinkPreviewOptions, Update
+from telegram import (
+    BotCommand,
+    BotCommandScopeChat,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    LinkPreviewOptions,
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -61,6 +54,9 @@ from telegram.ext import (
 )
 
 import checker
+import countries as C
+import ui
+from access import PERMISSIONS, UPLOAD_PERMS, AccessStore, StatsStore, parse_perm_words
 
 try:
     from dotenv import load_dotenv
@@ -99,41 +95,34 @@ def _parse_ids(text: str) -> set[int]:
     return ids
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGcwAbCTejwyYzpEm15LxyoNh2rsS7OGNA").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGkwwoRzvAz9Y3Zcan_JtLKxyeNEm8gS_M").strip()
 
-# Chats (private chats AND groups) that may use the bot. Group IDs are
-# negative numbers like -1001234567890.
+# ALLOWED_CHAT_IDS: personal IDs (positive) are ADMINS; group IDs (negative, -100...) are allowed groups.
 ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961"))
-# People who may use /allow and /disallow. Defaults to every positive
-# (= personal) ID in ALLOWED_CHAT_IDS.
 ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_IDS", "6206433961")) | {i for i in ENV_ALLOWED if i > 0}
+ENV_GROUPS = {i for i in ENV_ALLOWED if i < 0}
 
 DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
 DATA_DIR.mkdir(exist_ok=True)
 
-MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 600_000)   # per run
-CONCURRENCY = _env_int("CONCURRENCY", 600)                 # simultaneous requests, all workers together
-PROCESSES = _env_int("PROCESSES", 0) or None               # 0 = automatic
+MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 1_000_000)   # per run
+CONCURRENCY = _env_int("CONCURRENCY", 1000)                  # maximum simultaneous requests (auto-adjusts)
+PROCESSES = _env_int("PROCESSES", 0) or None                 # 0 = automatic
 CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 8.0)
 TOTAL_TIMEOUT = _env_float("TOTAL_TIMEOUT", 15.0)
 ATTEMPTS = _env_int("ATTEMPTS", 3)
 
-# Safety net: most link messages one run may send (the results file always has ALL).
-# 0 = unlimited.
-MAX_ALERTS_PER_RUN = _env_int("MAX_ALERTS_PER_RUN", 500)
-# Largest image the bot will download to send you (Telegram bots can upload up to 50 MB).
+MAX_ALERTS_PER_RUN = _env_int("MAX_ALERTS_PER_RUN", 500)     # 0 = unlimited (the results file always has ALL)
 MAX_IMAGE_BYTES = _env_int("MAX_IMAGE_MB", 20) * 1024 * 1024
-
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024        # Telegram bots can download files up to 20 MB
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024                          # Telegram's limit for files bots can download
 HISTORY_LIMIT = 50_000
 
 PROGRESS_SECONDS_PRIVATE = 3.0
-PROGRESS_SECONDS_GROUP = 6.0               # groups have stricter Telegram rate limits
-NOTIFY_PACE_PRIVATE = 0.3                  # pause between "working link" messages
+PROGRESS_SECONDS_GROUP = 6.0
+NOTIFY_PACE_PRIVATE = 0.3
 NOTIFY_PACE_GROUP = 1.5
-HEARTBEAT_SECONDS = 30 * 60                # autocheck status update interval
-AUTO_FILE_THRESHOLD = 10                   # autocheck sends a results file when >= this many found
-
+HEARTBEAT_SECONDS = 30 * 60
+AUTO_FILE_THRESHOLD = 10
 MIN_AUTOCHECK_MINUTES = 1
 MAX_AUTOCHECK_MINUTES = 10
 
@@ -143,116 +132,110 @@ NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("python-url-checker-bot")
 
+store = AccessStore(DATA_DIR, ADMIN_IDS)
+stats = StatsStore(DATA_DIR)
+
 
 # ============================================================
-# ALLOWED CHATS (env list + chats added with /allow)
+# ALLOWED GROUPS
 # ============================================================
 
-ALLOWED_FILE = DATA_DIR / "allowed_chats.json"
+GROUPS_FILE = DATA_DIR / "allowed_chats.json"
 
 
-def _load_dynamic() -> set[int]:
+def _load_groups() -> set[int]:
     try:
-        return {int(x) for x in json.loads(ALLOWED_FILE.read_text())}
+        return {int(x) for x in json.loads(GROUPS_FILE.read_text()) if int(x) < 0}
     except Exception:
         return set()
 
 
-dynamic_allowed: set[int] = _load_dynamic()
+dynamic_groups: set[int] = _load_groups()
 
 
-def _save_dynamic():
-    ALLOWED_FILE.write_text(json.dumps(sorted(dynamic_allowed)))
+def _save_groups():
+    GROUPS_FILE.write_text(json.dumps(sorted(dynamic_groups)))
 
 
-def is_allowed(chat_id: int) -> bool:
-    # If nobody is configured, nobody is allowed (safe default).
-    return chat_id in ENV_ALLOWED or chat_id in dynamic_allowed
-
-
-def restricted(handler):
-    @wraps(handler)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        chat, msg = update.effective_chat, update.effective_message
-        if chat is None or msg is None:
-            return
-        if not is_allowed(chat.id):
-            await msg.reply_text(
-                "🚫 Sorry, this chat is not authorized to use this bot.\n"
-                f"Chat ID: <code>{chat.id}</code>\n\n"
-                "The bot owner can allow it by adding this ID to <code>ALLOWED_CHAT_IDS</code> "
-                "or by sending /allow here.",
-                parse_mode=HTML,
-            )
-            return
-        return await handler(update, context)
-    return wrapper
+def group_allowed(chat_id: int) -> bool:
+    return chat_id in ENV_GROUPS or chat_id in dynamic_groups
 
 
 # ============================================================
-# DATES, SIZES  (Last modified is shown in Bangladesh time, 12-hour clock)
+# TELEGRAM HELPERS
 # ============================================================
 
-BD_TZ = timezone(timedelta(hours=6))      # Bangladesh: UTC+6, no daylight saving
-_DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
-_MONTHS = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
-
-
-def parse_http_date(raw) -> datetime | None:
-    if not raw:
-        return None
-    try:
-        dt = parsedate_to_datetime(str(raw))
-    except Exception:
-        return None
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt
-
-
-def fmt_bd(raw) -> str | None:
-    """'Mon, 09 Feb 2026 - 12:30 PM (Bangladesh Time)' from a Last-Modified header."""
-    dt = parse_http_date(raw)
-    if dt is None:
-        return None
-    dt = dt.astimezone(BD_TZ)
-    hour12 = dt.hour % 12 or 12
-    ampm = "AM" if dt.hour < 12 else "PM"
-    return (f"{_DAYS[dt.weekday()]}, {dt.day:02d} {_MONTHS[dt.month - 1]} {dt.year} - "
-            f"{hour12:02d}:{dt.minute:02d} {ampm} (Bangladesh Time)")
-
-
-def lm_epoch(raw) -> float:
-    dt = parse_http_date(raw)
-    return dt.timestamp() if dt else 0.0
-
-
-def fmt_size(n) -> str | None:
-    if not n:
-        return None
-    n = float(n)
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-
-
-def fmt_dur(seconds: float) -> str:
-    s = int(max(0, seconds))
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    if h:
-        return f"{h}h {m:02d}m {sec:02d}s"
-    if m:
-        return f"{m}m {sec:02d}s"
-    return f"{sec}s"
+def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
 
 
 def retry_seconds(exc: RetryAfter) -> float:
     ra = exc.retry_after
     return (ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 0.5
+
+
+async def say(msg, text: str, markup=None):
+    """Reply with an HTML card. Long texts are split on line breaks."""
+    chunks = [text]
+    if len(text) > 3900:
+        chunks, cur = [], ""
+        for line in text.split("\n"):
+            if len(cur) + len(line) + 1 > 3800:
+                chunks.append(cur)
+                cur = ""
+            cur += line + "\n"
+        chunks.append(cur)
+    sent = None
+    for k, chunk in enumerate(chunks):
+        sent = await msg.reply_text(chunk, parse_mode=HTML, link_preview_options=NO_PREVIEW,
+                                    reply_markup=markup if k == len(chunks) - 1 else None)
+    return sent
+
+
+async def edit_card(message, text: str, markup=None) -> bool:
+    """Edit a message to a new card; harmless if nothing changed."""
+    for use_markup in ((True, False) if markup is not None else (False,)):
+        try:
+            await message.edit_text(text[:4000], parse_mode=HTML, link_preview_options=NO_PREVIEW,
+                                    reply_markup=markup if use_markup else None)
+            return True
+        except RetryAfter as e:
+            await asyncio.sleep(retry_seconds(e))
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return True
+            logger.info("edit failed: %s", e)
+        except Exception:
+            logger.exception("edit failed")
+            return False
+    return False
+
+
+async def notify_user(bot, uid: int, text: str):
+    try:
+        await bot.send_message(chat_id=uid, text=text, parse_mode=HTML, link_preview_options=NO_PREVIEW)
+    except Exception:
+        logger.info("Could not message user %s", uid)
+
+
+_throttle: dict[tuple, float] = {}
+
+
+def throttled(key: tuple, seconds: float = 30.0) -> bool:
+    """True if this key was used less than `seconds` ago (so don't repeat the reply)."""
+    now = time.monotonic()
+    last = _throttle.get(key)
+    if last is not None and now - last < seconds:
+        return True
+    _throttle[key] = now
+    if len(_throttle) > 5000:               # keep the table small
+        for k in [k for k, v in _throttle.items() if now - v > 300]:
+            _throttle.pop(k, None)
+    return False
+
+
+def is_private(chat) -> bool:
+    return chat.type == "private"
 
 
 # ============================================================
@@ -283,7 +266,7 @@ def save_settings(chat_id: int):
 
 def save_history(chat_id: int):
     hist = chat_state[chat_id]["history"]
-    if len(hist) > HISTORY_LIMIT:                       # keep the newest entries
+    if len(hist) > HISTORY_LIMIT:
         keep = sorted(hist.items(), key=lambda kv: kv[1].get("first", 0), reverse=True)[:HISTORY_LIMIT]
         hist.clear()
         hist.update(keep)
@@ -298,16 +281,14 @@ def get_state(chat_id: int) -> dict:
         chat_state[chat_id] = {
             "words": checker.read_lines(d / "wordlist.txt")[0],
             "links": checker.read_lines(d / "linklist.txt")[0],
-            "history": _read_json(d / "found_history.json", {}),   # url -> {"first": epoch, "lm": raw}
+            "history": _read_json(d / "found_history.json", {}),
             "notify_mode": notify if notify in ("all", "new") else "all",
             "interval_minutes": settings.get("interval"),
-            "run": None,                 # the running checker.CheckRun, if any
-            "run_kind": None,            # "manual" or "auto"
-            "busy": False,               # True from the moment a check is started
+            "run": None,
+            "run_kind": None,
+            "busy": False,
             "pending_cancel": False,
             "stop_notify": False,
-            "cycles_run": 0,
-            "skipped_cycles": 0,
             "last_run_time": None,
             "last_run_checked": 0,
             "last_run_working": 0,
@@ -317,92 +298,179 @@ def get_state(chat_id: int) -> dict:
 
 
 # ============================================================
-# TEXT BUILDERS
+# ACCESS CONTROL  (admin approval, per-command permissions, country onboarding)
 # ============================================================
 
-def render_progress(run: checker.CheckRun) -> str:
-    s = run.snapshot()
-    total = s["total"] or 1
-    pct = min(100.0, s["processed"] * 100.0 / total)
-    filled = int(pct // 5)
-    bar = "█" * filled + "░" * (20 - filled)
-    lines = [
-        "🔎 Checking links...",
-        f"{bar} {pct:.1f}%",
-        f"Checked: {s['processed']:,} / {s['total']:,}",
-        f"Working found: {s['found']:,}",
-    ]
-    if s["speed"] > 0:
-        lines.append(f"Speed: {s['speed']:,.0f} links/sec")
-    lines.append(f"Elapsed: {fmt_dur(s['elapsed'])}")
-    if s["in_retry"]:
-        lines.append(f"Re-checking {s['retrying']:,} links that had network errors...")
-        lines.append("Time left: almost done")
-    elif s["eta"] is not None:
-        lines.append(f"Time left: ~{fmt_dur(s['eta'])}")
-    else:
-        lines.append("Time left: calculating...")
-    if s["retrying"] and not s["in_retry"]:
-        lines.append(f"Retrying (network errors): {s['retrying']:,}")
-    if run.suspicious:
-        lines.append("⚠️ Unusually many links look 'working' - the server may be answering everything.")
-    lines.append(f"Worker processes: {s['processes']}")
-    lines.append("Send /cancel to stop.")
-    return "\n".join(lines)
+async def submit_request(context, rec: dict):
+    """Tell the admins that someone wants access (only once per user)."""
+    if rec.get("requested"):
+        return
+    delivered = False
+    for admin in store.admin_ids:
+        try:
+            await context.bot.send_message(chat_id=admin, text=ui.request_admin_card(rec), parse_mode=HTML,
+                                           reply_markup=kb(ui.request_buttons(rec["id"])))
+            delivered = True
+        except Exception:
+            logger.info("Could not notify admin %s (the admin must send /start to the bot once)", admin)
+    if delivered:                      # otherwise try again next time the user writes
+        rec["requested"] = True
+        store.save()
 
 
-def build_summary(run: checker.CheckRun, extra: list[str] | None = None) -> str:
-    if run.cancelled:
-        head = "🛑 Check cancelled."
-    elif run.aborted or run.crashed or run.errors:
-        head = "⚠️ Check stopped early."
-    elif run.unverified_count:
-        head = "⚠️ Check finished, but some links could not be verified."
-    else:
-        head = "✅ Check complete!"
-    checked = f"{run.processed:,}" + (f" of {run.total:,}" if run.processed != run.total else "")
-    lines = [
-        head,
-        f"Link templates: {len(run.links):,}  |  Words: {len(run.words):,}",
-        f"Total combinations: {run.total:,}",
-        f"Checked: {checked}",
-        f"Working found: {len(run.found):,}",
-    ]
-    if run.unverified_count:
-        lines.append(f"Could not verify: {run.unverified_count:,} (network/server errors - list attached)")
-    el = run.elapsed()
-    avg = f" (average {run.processed / el:,.0f} links/sec)" if el > 0 and run.processed else ""
-    lines.append(f"Time taken: {fmt_dur(el)}{avg}")
-    if run.soft404:
-        lines.append("ℹ️ This server answers non-existent links with a placeholder - those were filtered out automatically.")
-    if run.suspicious:
-        pct = len(run.found) * 100 / max(1, run.processed)
-        lines.append(f"⚠️ {pct:.0f}% of the links look 'working'. That is not normal, so these results may be wrong. "
-                     "Send /test <one link> to see what the server really answers.")
-    if run.aborted:
-        lines.append("The server stopped answering (too many errors in a row). "
-                     "Try again later or lower CONCURRENCY in .env.")
-    if run.crashed:
-        lines.append(f"{len(run.crashed)} worker process(es) crashed - results may be incomplete.")
-    if run.errors:
-        lines.append(f"Error: {run.errors[0][:200]}")
-    lines.extend(extra or [])
-    return "\n".join(lines)
+COUNTRY_PAGE = 10
 
 
-def build_caption(url: str, lm_raw, size, known: bool) -> str:
-    head = "✅ Working Link Found! (seen before)" if known else "🆕 NEW Working Link Found!"
-    lines = [head, url, "", "📅 Last modified:", fmt_bd(lm_raw) or "not provided by the server"]
-    sz = fmt_size(size)
-    if sz:
-        lines.append(f"📦 Size: {sz}")
-    return "\n".join(lines)
+def country_page(page: int, scope: str) -> tuple[list[list[tuple[str, str]]], int]:
+    pages = (len(C.COUNTRIES) + COUNTRY_PAGE - 1) // COUNTRY_PAGE
+    page = max(0, min(page, pages - 1))
+    chunk = list(range(page * COUNTRY_PAGE, min(len(C.COUNTRIES), (page + 1) * COUNTRY_PAGE)))
+    rows, row = [], []
+    for idx in chunk:
+        row.append((C.country_label(idx), f"cty:s:{scope}:{idx}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([("◀️", f"cty:p:{scope}:{max(0, page - 1)}"), (f"{page + 1}/{pages}", f"cty:p:{scope}:{page}"),
+                 ("▶️", f"cty:p:{scope}:{min(pages - 1, page + 1)}")])
+    return rows, page
 
 
-def result_lines(items: list[tuple[str, str | None]]) -> list[str]:
-    """[(url, last_modified_raw)] -> text lines, newest file first."""
-    rows = sorted(((lm_epoch(raw), url, fmt_bd(raw)) for url, raw in items), key=lambda r: r[0], reverse=True)
-    return [f"{url}  |  Last modified: {lm or 'not provided by the server'}" for _, url, lm in rows]
+async def send_country_picker(msg, first_time: bool, scope: str = "u"):
+    rows, _ = country_page(0, scope)
+    await say(msg, ui.country_picker_text(first_time), kb(rows))
+
+
+async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE, need, cmd: str) -> bool:
+    """Decide whether this user may run this command. Sends the right explanation if not."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat is None or user is None or msg is None:
+        return False
+    rec = store.touch(user)
+    private = is_private(chat)
+
+    if not private and not group_allowed(chat.id):
+        if not throttled(("grp", chat.id), 60):
+            await say(msg, ui.group_denied_card(chat.id))
+        return False
+
+    status = store.status(user.id)
+    if status == "denied":
+        if not throttled(("den", user.id), 60):
+            await say(msg, ui.denied_card())
+        return False
+    if status == "pending":
+        if not private:
+            if not throttled(("pend", user.id), 60):
+                await say(msg, ui.notice("🔒", "Access required",
+                                         "You need the admin's approval first.",
+                                         "<i>Open a private chat with me and send /start.</i>"))
+            return False
+        if not store.has_tz(user.id):
+            await send_country_picker(msg, first_time=True)
+            return False
+        await submit_request(context, rec)
+        await say(msg, ui.pending_card(rec["name"], None))
+        return False
+
+    if need is not None and not store.can(user.id, need):
+        if not throttled(("perm", user.id, cmd), 20):
+            await say(msg, ui.no_perm_card(cmd, store.allowed_keys(user.id)))
+        return False
+    if private and not store.has_tz(user.id):
+        await send_country_picker(msg, first_time=True)
+        return False
+    return True
+
+
+def gated(need, cmd: str | None = None):
+    def deco(handler):
+        name = cmd or handler.__name__.removesuffix("_cmd")
+
+        @wraps(handler)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not await gate(update, context, need, name):
+                return
+            return await handler(update, context)
+        return wrapper
+    return deco
+
+
+def admin_only(private_only: bool = False):
+    def deco(handler):
+        @wraps(handler)
+        async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+            if chat is None or user is None or msg is None:
+                return
+            if not store.is_admin(user.id):
+                if not throttled(("adm", user.id), 30):
+                    await say(msg, ui.notice("⛔", "Admin only", "This command is only for the bot admin."))
+                return
+            if private_only and not is_private(chat):
+                await say(msg, ui.notice("🔐", "Private chat only",
+                                         "<i>For safety, please use this command in a private chat with me.</i>"))
+                return
+            return await handler(update, context)
+        return wrapper
+    return deco
+
+
+def tz_of(chat_id: int) -> C.TzCtx:
+    return store.tz_ctx(chat_id)
+
+
+async def stop_autocheck_for(context, chat_id: int):
+    """Switch auto-check off for a chat (used when a user loses access)."""
+    jq = context.job_queue
+    if jq is not None:
+        for name in (f"check-{chat_id}", f"heartbeat-{chat_id}"):
+            for job in jq.get_jobs_by_name(name):
+                job.schedule_removal()
+    st = chat_state.get(chat_id)
+    if st:
+        st["interval_minutes"] = None
+        save_settings(chat_id)
+
+
+async def enforce_permissions(context, uid: int):
+    """After a permission change: stop what the user may no longer do (private chat = user id)."""
+    if not store.can(uid, "autocheck"):
+        await stop_autocheck_for(context, uid)
+    st = chat_state.get(uid)
+    if st and st["run"] is not None and not st["run"].finished and not store.can(uid, ("check", "addword", "autocheck")):
+        st["run"].cancel()
+
+
+# ============================================================
+# DATES / RESULT FILES
+# ============================================================
+
+def checker_parse(raw):
+    from email.utils import parsedate_to_datetime
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(str(raw))
+    except Exception:
+        return None
+    if dt is not None and dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def lm_epoch(raw) -> float:
+    dt = checker_parse(raw)
+    return dt.timestamp() if dt else 0.0
+
+
+def result_lines(items: list[tuple[str, str | None]], tz: C.TzCtx) -> list[str]:
+    """[(url, last_modified_raw)] -> text lines, newest file first, in the user's time."""
+    rows = sorted(((lm_epoch(raw), url, checker_parse(raw)) for url, raw in items), key=lambda r: r[0], reverse=True)
+    return [f"{url}  |  Last modified: {tz.fmt(dt) + ' (' + tz.label + ')' if dt else 'not provided by the server'}"
+            for _, url, dt in rows]
 
 
 # ============================================================
@@ -412,16 +480,13 @@ def result_lines(items: list[tuple[str, str | None]]) -> list[str]:
 class Notifier:
     """Sends found links one by one (paced + retried), WITH the image.
 
-    How an image is delivered (first one that works):
-      1. the bot downloads the picture itself and uploads it as a photo
-      2. if Telegram refuses it as a photo (too big / odd shape) -> as a file
-      3. if the picture can't be downloaded -> Telegram is asked to fetch the link
-      4. last resort -> the link as text
-    Plain text only (no Markdown): "_" in a link must never break a message.
+    Delivery order (first that works): download the picture and upload it as a photo ->
+    send it as a file -> ask Telegram to fetch the link -> the link as text.
+    Captions are HTML (escaped); if Telegram ever refuses the formatting, a plain caption is used.
     """
 
-    def __init__(self, bot, chat_id: int, mode: str, history: dict):
-        self.bot, self.chat_id, self.mode, self.history = bot, chat_id, mode, history
+    def __init__(self, bot, chat_id: int, mode: str, history: dict, tz: C.TzCtx):
+        self.bot, self.chat_id, self.mode, self.history, self.tz = bot, chat_id, mode, history, tz
         self.pace = NOTIFY_PACE_GROUP if chat_id < 0 else NOTIFY_PACE_PRIVATE
         self.queue: asyncio.Queue = asyncio.Queue()
         self.pending = 0
@@ -430,6 +495,9 @@ class Notifier:
         self.suppressed_cap = 0
         self.suppressed_known = 0
         self.failed: list[str] = []
+        self.parse_error = False
+        self.prefetched = 0
+        self.prefetch_tasks: set[asyncio.Task] = set()
         self.http = aiohttp.ClientSession(
             connector=aiohttp.TCPConnector(ssl=False),
             timeout=aiohttp.ClientTimeout(total=60),
@@ -448,13 +516,21 @@ class Notifier:
             return
         self.accepted += 1
         self.pending += 1
-        self.queue.put_nowait((url, meta or {}, known))
+        task = None
+        if self.prefetched < 6:             # download the picture while earlier ones are being sent
+            self.prefetched += 1
+            task = asyncio.create_task(self._download(url))
+            self.prefetch_tasks.add(task)
+            task.add_done_callback(self.prefetch_tasks.discard)
+        self.queue.put_nowait((url, meta or {}, known, task))
 
     async def _loop(self):
         while True:
-            url, meta, known = await self.queue.get()
+            url, meta, known, task = await self.queue.get()
+            if task is not None:
+                self.prefetched -= 1
             try:
-                if await self.deliver(url, meta, known):
+                if await self.deliver(url, meta, known, task):
                     self.sent += 1
                 else:
                     self.failed.append(url)
@@ -468,7 +544,7 @@ class Notifier:
                 self.pending -= 1
 
     async def _download(self, url: str):
-        """Returns (bytes | None, last_modified_raw | None, size | None)."""
+        """(bytes | None, last_modified_raw | None, size | None)"""
         try:
             async with self.http.get(url, allow_redirects=True, max_redirects=5) as resp:
                 if resp.status != 200:
@@ -491,14 +567,17 @@ class Notifier:
             return None, None, None
 
     async def _try(self, send, attempts: int = 5) -> bool:
-        """Run one Telegram send. True = delivered, False = Telegram refused it (try the next way)."""
+        """One Telegram send. True = delivered, False = Telegram refused it (try the next way)."""
         for _ in range(attempts):
             try:
                 await send()
                 return True
-            except RetryAfter as e:                      # Telegram says: slow down
+            except RetryAfter as e:
                 await asyncio.sleep(retry_seconds(e))
-            except (BadRequest, Forbidden) as e:         # must come before NetworkError (BadRequest is a subclass)
+            except (BadRequest, Forbidden) as e:        # before NetworkError: BadRequest is a subclass
+                low = str(e).lower()
+                if "parse" in low or "entities" in low:
+                    self.parse_error = True
                 logger.info("Telegram refused a message: %s", e)
                 return False
             except (TimedOut, NetworkError):
@@ -508,22 +587,41 @@ class Notifier:
                 return False
         return False
 
-    async def deliver(self, url: str, meta: dict, known: bool) -> bool:
+    async def _chain(self, data, url: str, caption: str, filename: str, html: bool) -> bool:
         bot, chat_id = self.bot, self.chat_id
-        data, lm, size = await self._download(url)
-        caption = build_caption(url, lm or meta.get("lm"), size or meta.get("sz"), known)
-        filename = (url.split("?", 1)[0].rsplit("/", 1)[-1] or "image.jpg")
-
+        pm = HTML if html else None
+        self.parse_error = False
         if data:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=data, caption=caption)):
+            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=data, caption=caption, parse_mode=pm)):
                 return True
-            if await self._try(lambda: bot.send_document(chat_id=chat_id, document=data,
-                                                         filename=filename, caption=caption)):
+            if self.parse_error:
+                return False
+            if await self._try(lambda: bot.send_document(chat_id=chat_id, document=data, filename=filename,
+                                                         caption=caption, parse_mode=pm)):
                 return True
         else:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=url, caption=caption)):
+            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode=pm)):
                 return True
-        return await self._try(lambda: bot.send_message(chat_id=chat_id, text=caption))
+            if self.parse_error:
+                return False
+        return await self._try(lambda: bot.send_message(chat_id=chat_id, text=caption, parse_mode=pm,
+                                                        link_preview_options=NO_PREVIEW))
+
+    async def deliver(self, url: str, meta: dict, known: bool, task=None) -> bool:
+        data, lm, size = await (task if task is not None else self._download(url))
+        kind = dims = None
+        if data:
+            kind = checker.sniff_image(data[:16])
+            dims = checker.image_size(data[:262144])
+        filename = url.split("?", 1)[0].rsplit("/", 1)[-1] or "image.jpg"
+        for html in (True, False):
+            caption = ui.alert_caption(url, lm or meta.get("lm"), size or meta.get("sz"), known, self.tz,
+                                       kind, dims, html)
+            if await self._chain(data, url, caption, filename, html):
+                return True
+            if not self.parse_error:
+                break
+        return False
 
     async def drain(self, should_abort, timeout: float | None = None):
         start = time.monotonic()
@@ -534,7 +632,9 @@ class Notifier:
 
     async def aclose(self):
         self.task.cancel()
-        await asyncio.gather(self.task, return_exceptions=True)
+        for t in list(self.prefetch_tasks):
+            t.cancel()
+        await asyncio.gather(self.task, *self.prefetch_tasks, return_exceptions=True)
         try:
             await self.http.close()
         except Exception:
@@ -548,16 +648,11 @@ async def progress_loop(run: checker.CheckRun, msg, chat_id: int):
         await asyncio.sleep(interval)
         if run.finished:
             break
-        text = render_progress(run)
+        text = ui.progress_card(run.snapshot(), run.suspicious)
         if text == last:
             continue
-        try:
-            await msg.edit_text(text)
+        if await edit_card(msg, text):
             last = text
-        except RetryAfter as e:
-            await asyncio.sleep(retry_seconds(e))
-        except Exception:
-            pass  # "message is not modified" etc. - harmless
 
 
 async def send_text_file(bot, chat_id: int, path: Path, caption: str):
@@ -578,9 +673,9 @@ async def send_text_file(bot, chat_id: int, path: Path, caption: str):
 # ============================================================
 
 async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, words_override=None):
-    """Run one complete check for a chat (kind = "manual" or "auto").
-    words_override: check only these words (used by /addword)."""
+    """One complete check for a chat (kind = "manual" or "auto"). words_override: only these words."""
     state = get_state(chat_id)
+    tz = tz_of(chat_id)
     workdir = None
     notifier = None
     ptask = None
@@ -598,9 +693,8 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
             state["pending_cancel"] = False
             run.cancel()
 
-        # Auto-check can be set to alert only for NEW links; manual checks always show everything.
         mode = state["notify_mode"] if kind == "auto" else "all"
-        notifier = Notifier(bot, chat_id, mode, state["history"])
+        notifier = Notifier(bot, chat_id, mode, state["history"], tz)
         if progress_msg is not None:
             ptask = asyncio.create_task(progress_loop(run, progress_msg, chat_id))
 
@@ -621,7 +715,6 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
         def stop_sending() -> bool:
             return run.cancelled or state["stop_notify"]
 
-        # Give the individual "working link" messages a moment to go out.
         await notifier.drain(stop_sending, timeout=30)
 
         # ---- statistics + history ----
@@ -629,9 +722,11 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
         state["last_run_checked"] = run.processed
         state["last_run_working"] = len(run.found)
         state["last_run_unverified"] = run.unverified_count
-        if kind == "auto" and not run.cancelled:
-            state["cycles_run"] += 1
-        if run.found and not run.suspicious:      # never pollute the history with doubtful results
+        el = run.elapsed()
+        stats.add(chat_id, checks=1, combos=run.processed, found=len(run.found), unverified=run.unverified_count,
+                  seconds=el, best_speed=(run.processed / el if el > 0 else 0),
+                  auto_cycles=1 if (kind == "auto" and not run.cancelled) else 0)
+        if run.found and not run.suspicious:
             now = time.time()
             for url in run.found:
                 lm = (run.found_meta.get(url) or {}).get("lm")
@@ -653,35 +748,33 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
         if notifier.pending > 0 and not stop_sending():
             extra.append(f"Still sending {notifier.pending:,} working-link message(s) - "
                          "the file below already contains all of them.")
-        summary = build_summary(run, extra)
+        summary = ui.summary_card(run, extra, tz)
         problem = bool(run.aborted or run.crashed or run.errors)
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if kind == "manual":
-            try:
-                await progress_msg.edit_text(summary)
-            except Exception:
-                await bot.send_message(chat_id=chat_id, text=summary)
+            if not await edit_card(progress_msg, summary):
+                await bot.send_message(chat_id=chat_id, text=summary[:4000], parse_mode=HTML)
         elif problem:
-            await bot.send_message(chat_id=chat_id, text="⚠️ Auto-check problem:\n" + summary)
+            await bot.send_message(chat_id=chat_id, text=("⚠️ <b>Auto-check problem</b>\n" + summary)[:4000], parse_mode=HTML)
 
         if run.found and (kind == "manual" or len(run.found) >= AUTO_FILE_THRESHOLD):
             p = workdir / f"working_links_{stamp}.txt"
-            lines = result_lines([(u, (run.found_meta.get(u) or {}).get("lm")) for u in run.found])
+            lines = result_lines([(u, (run.found_meta.get(u) or {}).get("lm")) for u in run.found], tz)
             p.write_text("\n".join(lines) + "\n", encoding="utf-8")
             await send_text_file(bot, chat_id, p,
-                                 f"All {len(run.found):,} working link(s) from this check (newest file first).")
+                                 f"📎 All {len(run.found):,} working link(s) from this check · newest first · {tz.label}")
 
         if run.unverified_count and kind == "manual":
             p = workdir / f"unverified_links_{stamp}.txt"
             written = run.write_unverified(p)
-            note = f"{run.unverified_count:,} link(s) could not be verified (network/server errors)."
+            note = f"⚠️ {run.unverified_count:,} link(s) could not be verified (network/server errors)."
             if written < run.unverified_count:
                 note += f" First {written:,} listed."
             await send_text_file(bot, chat_id, p, note)
 
-        # Finish delivering the individual messages (the file already has everything).
         await notifier.drain(stop_sending)
+        stats.add(chat_id, alerts=notifier.sent)
         if notifier.failed:
             logger.warning("%d link message(s) could not be delivered individually (they are in the results file)",
                            len(notifier.failed))
@@ -690,7 +783,8 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
     except Exception:
         logger.exception("Check session crashed")
         try:
-            await bot.send_message(chat_id=chat_id, text="❌ Something went wrong while checking. See the bot log.")
+            await bot.send_message(chat_id=chat_id, parse_mode=HTML,
+                                   text=ui.warn("Something went wrong", "<i>The check could not finish. Please try again.</i>"))
         except Exception:
             pass
     finally:
@@ -717,73 +811,72 @@ def _start_background_check(context, chat_id: int, progress_msg, words_override=
 
 
 def _check_ready(state: dict, words=None) -> str | None:
-    """Return an error message if a check can't start, else None."""
+    """HTML error text if a check can't start, else None."""
     words = state["words"] if words is None else words
     if not words or not state["links"]:
-        return "⚠️ Please send both wordlist.txt and linklist.txt first. Use /help to see how."
+        return ui.warn("Files needed", "Please send both <code>wordlist.txt</code> and <code>linklist.txt</code> first.",
+                       "<i>Use /help to see how.</i>")
     total = checker.count_combinations(state["links"], words)
     if total == 0:
-        return "⚠️ Nothing to check - your lists produce 0 links."
+        return ui.warn("Nothing to check", "Your lists produce 0 links.")
     if total > MAX_COMBINATIONS:
-        return (f"⚠️ {total:,} combinations ({len(state['links']):,} links × {len(words):,} words) "
-                f"is more than the limit of {MAX_COMBINATIONS:,} per run.\n"
-                "Split your lists into smaller files, or raise MAX_COMBINATIONS in .env.")
+        return ui.warn("Too many combinations",
+                       f"<b>{total:,}</b> ({len(state['links']):,} links × {len(words):,} words) is more than the "
+                       f"limit of <b>{MAX_COMBINATIONS:,}</b> per run.",
+                       "<i>Split your lists into smaller files, or raise MAX_COMBINATIONS in .env.</i>")
     return None
 
 
 # ============================================================
-# COMMANDS
+# ONBOARDING: /start, /country, /help, /id
 # ============================================================
 
-@restricted
+async def finish_onboarding(context, chat_id: int, user, rec: dict):
+    """After the country is chosen: welcome approved users, send the request for new ones."""
+    status = store.status(user.id)
+    ctx = tz_of(user.id)
+    if status in ("admin", "approved"):
+        keys = store.allowed_keys(user.id)
+        await context.bot.send_message(
+            chat_id=chat_id, parse_mode=HTML, link_preview_options=NO_PREVIEW,
+            text=ui.welcome_card(rec["name"], ctx, store.access_text(user.id), keys, MAX_COMBINATIONS, store.is_admin(user.id)))
+    elif status == "pending":
+        await submit_request(context, rec)
+        await context.bot.send_message(chat_id=chat_id, text=ui.pending_card(rec["name"], ctx), parse_mode=HTML)
+    else:
+        await context.bot.send_message(chat_id=chat_id, text=ui.denied_card(), parse_mode=HTML)
+
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "👋 <b>Welcome to Python Url Checker!</b>\n\n"
-        f"I check huge batches of links at high speed (up to {MAX_COMBINATIONS:,} link × word "
-        "combinations in one run) and tell you the instant a file really goes live — "
-        "with its image and the date it was uploaded.\n\n"
-        "<b>How it works</b>\n"
-        "1️⃣ Send me <code>wordlist.txt</code> — one word per line.\n"
-        "2️⃣ Send me <code>linklist.txt</code> — one link per line, with <code>(Word)</code> "
-        "where the word should go.\n"
-        "3️⃣ Send /check — every link is tested with every word, with live progress, speed and "
-        "time left. /cancel stops it any time.\n"
-        "4️⃣ Optional: <code>/autocheck 5</code> re-checks automatically every 5 minutes.\n\n"
-        "Quick tools: /addword (add + check new words instantly), /test (diagnose one link), "
-        "/found (everything found so far).\n\nType /help for all commands. 🚀"
-    )
-    await update.effective_message.reply_text(text, parse_mode=HTML)
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat is None or user is None or msg is None:
+        return
+    rec = store.touch(user)
+    if not is_private(chat):
+        if not group_allowed(chat.id):
+            if not throttled(("grp", chat.id), 60):
+                await say(msg, ui.group_denied_card(chat.id))
+            return
+        if not store.can(user.id, None):
+            if not throttled(("pend", user.id), 60):
+                await say(msg, ui.notice("🔒", "Access required", "You need the admin's approval first.",
+                                         "<i>Open a private chat with me and send /start.</i>"))
+            return
+        await say(msg, ui.notice("✨", "Ready!", f"🕒 Times here use <b>{ui.e(tz_of(chat.id).label)}</b>.",
+                                 "<i>Send /help to see what you can do. Group admins can change the time zone with /country.</i>"))
+        return
+    if not store.has_tz(user.id):
+        await send_country_picker(msg, first_time=True)
+        return
+    await finish_onboarding(context, chat.id, user, rec)
 
 
-@restricted
+@gated(None)
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "📖 <b>Python Url Checker — Help</b>\n\n"
-        "<b>Step 1 — upload two files</b> (send them as documents):\n"
-        "• <code>wordlist.txt</code> — one word per line\n"
-        "• <code>linklist.txt</code> — one link per line, e.g.\n"
-        "<code>https://example.com/img_(Word)_en.jpg</code>\n"
-        "Send a file again any time to replace it. Max file size: 20 MB.\n\n"
-        "<b>Checking</b>\n"
-        "/check — check every link with every word (live progress + time left)\n"
-        "/cancel — stop a running check (also works as /cancle)\n"
-        "/addword <code>Word1 Word2</code> — add words to your list and check ONLY those right away\n"
-        "/test <code>link</code> — see exactly what the server answers for one link\n\n"
-        "<b>Results</b>\n"
-        "/found — every working link found so far, newest first (<code>/found clear</code> empties it)\n\n"
-        "<b>Automatic checking</b>\n"
-        "/autocheck <code>N</code> — re-check every N minutes (1–10), status update every 30 min. "
-        "It resumes by itself after a restart.\n"
-        "/notify <code>all</code> | <code>new</code> — auto-check alerts: every time, or only for NEW links\n"
-        "/stopautocheck — stop it\n\n"
-        "<b>Other</b>\n"
-        "/status — what is loaded / running · /resetstats — clear counters · /id — this chat's ID\n"
-        "/allow, /disallow, /allowed — (admin) manage which chats and groups may use the bot\n\n"
-        f"Limit: {MAX_COMBINATIONS:,} combinations per run. A link only counts as working when a real "
-        "file is there. Network errors are retried, and anything that still can't be verified is "
-        "reported — nothing is silently skipped."
-    )
-    await update.effective_message.reply_text(text, parse_mode=HTML)
+    user = update.effective_user
+    keys = store.allowed_keys(user.id)
+    uploads = store.can(user.id, UPLOAD_PERMS)
+    await say(update.effective_message, ui.help_card(keys, store.is_admin(user.id), MAX_COMBINATIONS, uploads))
 
 
 async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -791,148 +884,123 @@ async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
     if chat is None or msg is None:
         return
-    text = (
-        f"Chat ID: <code>{chat.id}</code>\n"
-        f"Chat type: {escape(chat.type)}\n"
-        f"Your user ID: <code>{user.id if user else 'unknown'}</code>\n"
-        f"Allowed: {'yes ✅' if is_allowed(chat.id) else 'no ❌'}"
-    )
-    await msg.reply_text(text, parse_mode=HTML)
+    status = store.status(user.id) if user else "pending"
+    where = f"Allowed ✅" if (group_allowed(chat.id) if not is_private(chat) else store.can(user.id, None)) else "Not allowed ❌"
+    await say(msg, ui.notice("🆔", "IDs",
+                             f"💬 Chat ID  <code>{chat.id}</code>",
+                             f"📂 Chat type  <code>{ui.e(chat.type)}</code>",
+                             f"👤 Your user ID  <code>{user.id if user else 'unknown'}</code>",
+                             f"🎛 Your status  <b>{ui.e(status)}</b>",
+                             f"🔐 This chat  <b>{where}</b>"))
 
 
-async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def country_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Choose your country (private chat) or the group's time zone (group admin)."""
     chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
-    if chat is None or msg is None:
+    if chat is None or user is None or msg is None:
         return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /allow.")
-        return
-    target = chat.id
-    if context.args:
-        try:
-            target = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /allow  (allow this chat)  or  /allow -1001234567890")
+    rec = store.touch(user)
+    private = is_private(chat)
+    if not private:
+        if not group_allowed(chat.id):
+            if not throttled(("grp", chat.id), 60):
+                await say(msg, ui.group_denied_card(chat.id))
             return
-    if is_allowed(target):
-        await msg.reply_text(f"Chat {target} is already allowed ✅")
-        return
-    dynamic_allowed.add(target)
-    _save_dynamic()
-    await msg.reply_text(f"✅ Chat {target} is now allowed to use this bot.")
-
-
-async def disallow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
-    if chat is None or msg is None:
-        return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /disallow.")
-        return
-    target = chat.id
-    if context.args:
-        try:
-            target = int(context.args[0])
-        except ValueError:
-            await msg.reply_text("Usage: /disallow  (this chat)  or  /disallow -1001234567890")
+        if not store.is_admin(user.id):
+            await say(msg, ui.notice("⛔", "Admin only", "Only the bot admin can change a group's time zone."))
             return
-    if target in ENV_ALLOWED:
-        await msg.reply_text("That chat is set in ALLOWED_CHAT_IDS (.env). Remove it there and restart the bot.")
+    if store.status(user.id) == "denied":
+        await say(msg, ui.denied_card())
         return
-    if target not in dynamic_allowed:
-        await msg.reply_text("That chat wasn't added with /allow.")
+    if not context.args:
+        await send_country_picker(msg, first_time=private and not store.has_tz(user.id), scope="u" if private else "g")
         return
-    dynamic_allowed.discard(target)
-    _save_dynamic()
-    await msg.reply_text(f"🗑 Chat {target} removed.")
-
-
-async def allowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user, msg = update.effective_user, update.effective_message
-    if msg is None:
+    ctx = C.ctx_from_text(" ".join(context.args))
+    if ctx is None:
+        await say(msg, ui.warn("Country not found",
+                               "Try the country name, e.g. <code>/country India</code>,",
+                               "a zone like <code>/country Asia/Dhaka</code>, or an offset like <code>/country UTC+5:30</code>.",
+                               "<i>Or send just /country to pick from a list.</i>"))
         return
-    if user is None or user.id not in ADMIN_IDS:
-        await msg.reply_text("⛔ Only the bot admin can use /allowed.")
+    first = private and not store.has_tz(user.id)
+    if private:
+        store.set_user_tz(user.id, ctx)
+    else:
+        store.set_chat_tz(chat.id, ctx)
+    await say(msg, ui.country_set_card(ctx))
+    if first:
+        await finish_onboarding(context, chat.id, user, rec)
+
+
+async def country_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    parts = q.data.split(":")            # cty:p|s:scope:value
+    user, chat = q.from_user, q.message.chat
+    scope = parts[2]
+    if parts[1] == "p":
+        rows, _ = country_page(int(parts[3]), scope)
+        await q.answer()
+        try:
+            await q.edit_message_reply_markup(reply_markup=kb(rows))
+        except BadRequest:
+            pass
         return
-    env_list = ", ".join(str(i) for i in sorted(ENV_ALLOWED)) or "none"
-    dyn_list = ", ".join(str(i) for i in sorted(dynamic_allowed)) or "none"
-    await msg.reply_text(f"From .env: {env_list}\nAdded with /allow: {dyn_list}")
+    idx = int(parts[3])
+    ctx = C.ctx_for_country(idx)
+    rec = store.touch(user)
+    if scope == "g":
+        if not store.is_admin(user.id) or not group_allowed(chat.id):
+            await q.answer("Only the bot admin can change the group's time zone.", show_alert=True)
+            return
+        store.set_chat_tz(chat.id, ctx)
+        await q.answer("Saved")
+        await edit_card(q.message, ui.country_set_card(ctx))
+        return
+    if store.status(user.id) == "denied":
+        await q.answer("No access.", show_alert=True)
+        return
+    first = not store.has_tz(user.id)
+    store.set_user_tz(user.id, ctx)
+    await q.answer("Saved ✅")
+    await edit_card(q.message, ui.country_set_card(ctx))
+    if first:
+        await finish_onboarding(context, q.message.chat.id, user, rec)
 
 
-@restricted
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    state = get_state(chat_id)
-    total = checker.count_combinations(state["links"], state["words"])
-    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}")
-    auto = f"every {state['interval_minutes']} min ✅" if jobs else "off ❌"
-    last = (datetime.fromtimestamp(state["last_run_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            if state["last_run_time"] else "never")
+# ============================================================
+# CHECKING COMMANDS
+# ============================================================
 
-    lines = [
-        "📊 <b>Status</b>",
-        f"Words loaded: <code>{len(state['words']):,}</code>",
-        f"Link templates loaded: <code>{len(state['links']):,}</code>",
-        f"Total combinations: <code>{total:,}</code> (limit {MAX_COMBINATIONS:,})",
-        f"Auto-check: {auto} · alerts: <b>{state['notify_mode']}</b>",
-        f"Auto-check cycles completed: <code>{state['cycles_run']}</code>"
-        + (f" (skipped {state['skipped_cycles']} because a check was still running)" if state["skipped_cycles"] else ""),
-        f"Last check: {last} — checked <code>{state['last_run_checked']:,}</code>, "
-        f"working <code>{state['last_run_working']:,}</code>, "
-        f"unverified <code>{state['last_run_unverified']:,}</code>",
-        f"Working links in history: <code>{len(state['history']):,}</code> (see /found)",
-    ]
-    run = state["run"]
-    if run is not None and not run.finished:
-        s = run.snapshot()
-        eta = fmt_dur(s["eta"]) if s["eta"] is not None else "calculating"
-        lines.append(
-            f"⏳ Running now ({state['run_kind']}): {s['processed']:,}/{s['total']:,} "
-            f"({s['processed'] * 100 / max(1, s['total']):.1f}%), time left ~{eta}"
-        )
-    elif state["busy"]:
-        lines.append("⏳ A check is starting...")
-    await update.effective_message.reply_text("\n".join(lines), parse_mode=HTML)
-
-
-@restricted
-async def resetstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    state = get_state(update.effective_chat.id)
-    state.update(cycles_run=0, skipped_cycles=0, last_run_time=None,
-                 last_run_checked=0, last_run_working=0, last_run_unverified=0)
-    await update.effective_message.reply_text("🧹 Counters cleared. (Your found-links history is kept - use /found clear to empty it.)")
-
-
-@restricted
+@gated("check")
 async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.effective_message
     state = get_state(chat_id)
 
     if state["busy"]:
-        await msg.reply_text("⏳ A check is already running. Use /cancel to stop it first.")
+        await say(msg, ui.warn("Already running", "A check is already running.", "<i>Use /cancel to stop it first.</i>"))
         return
     problem = _check_ready(state)
     if problem:
-        await msg.reply_text(problem)
+        await say(msg, problem)
         return
 
     total = checker.count_combinations(state["links"], state["words"])
     state["busy"] = True
     state["pending_cancel"] = False
     try:
-        progress_msg = await msg.reply_text(
-            f"🚀 Starting: {len(state['links']):,} links × {len(state['words']):,} words = {total:,} combinations\n"
-            "Send /cancel to stop."
-        )
+        progress_msg = await say(msg, ui.notice(
+            "🚀", "STARTING CHECK",
+            f"🔗 <code>{len(state['links']):,}</code> links × 📝 <code>{len(state['words']):,}</code> words "
+            f"= <b>{total:,}</b> combinations",
+            "<i>Preparing workers… send /cancel to stop.</i>"))
     except Exception:
         state["busy"] = False
         raise
-    # Runs in the background so the bot stays responsive (this is what makes /cancel work).
     _start_background_check(context, chat_id, progress_msg)
 
 
-@restricted
+@gated("addword")
 async def addword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Add words to the list and immediately check ONLY those words against every link."""
     chat_id = update.effective_chat.id
@@ -941,184 +1009,234 @@ async def addword_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     given = [w.strip() for w in context.args if w.strip()]
     if not given:
-        await msg.reply_text("Usage: /addword Word1 Word2 Word3\n"
-                             "Adds the words to your wordlist and checks only those words against all your links.")
+        await say(msg, ui.notice("➕", "ADD WORDS", "Usage: <code>/addword Word1 Word2 Word3</code>",
+                                 "<i>Adds the words to your wordlist and checks only those words against all your links.</i>"))
         return
     existing = set(state["words"])
     new = [w for w in dict.fromkeys(given) if w not in existing]
     if not new:
-        await msg.reply_text("Those word(s) are already in your wordlist. Use /check to check everything.")
+        await say(msg, ui.notice("ℹ️", "Nothing new", "Those word(s) are already in your wordlist.",
+                                 "<i>Use /check to check everything.</i>"))
         return
 
     state["words"] = state["words"] + new
     (chat_dir(chat_id) / "wordlist.txt").write_text("\n".join(state["words"]) + "\n", encoding="utf-8")
-    shown = ", ".join(new[:10]) + (" ..." if len(new) > 10 else "")
-    text = f"✅ Added {len(new)} word(s): {shown}\nWords in list: {len(state['words']):,}"
+    shown = ", ".join(new[:10]) + (" …" if len(new) > 10 else "")
+    added = (f"➕ Added <b>{len(new)}</b> word(s): <code>{ui.e(shown)}</code>\n"
+             f"📝 Words in list: <code>{len(state['words']):,}</code>")
 
     if not state["links"]:
-        await msg.reply_text(text + "\nNow send linklist.txt, then /check.")
+        await say(msg, ui.notice("✅", "WORDS SAVED", added, "<i>Now send linklist.txt, then /check.</i>"))
         return
     if state["busy"]:
-        await msg.reply_text(text + "\n⏳ A check is running - the new word(s) will be included in the next /check.")
+        await say(msg, ui.notice("✅", "WORDS SAVED", added,
+                                 "⏳ <i>A check is running — the new word(s) will be included in the next /check.</i>"))
         return
     problem = _check_ready(state, new)
     if problem:
-        await msg.reply_text(text + "\n" + problem)
+        await say(msg, ui.notice("✅", "WORDS SAVED", added) + "\n\n" + problem)
         return
 
     total = checker.count_combinations(state["links"], new)
     state["busy"] = True
     state["pending_cancel"] = False
     try:
-        progress_msg = await msg.reply_text(
-            f"{text}\n🚀 Checking only the new word(s) with all {len(state['links']):,} links "
-            f"({total:,} combinations)...\nSend /cancel to stop."
-        )
+        progress_msg = await say(msg, ui.notice(
+            "🚀", "CHECKING NEW WORDS", added,
+            f"🔗 <code>{len(state['links']):,}</code> links × <code>{len(new)}</code> new word(s) = <b>{total:,}</b> combinations",
+            "<i>Send /cancel to stop.</i>"))
     except Exception:
         state["busy"] = False
         raise
     _start_background_check(context, chat_id, progress_msg, words_override=new)
 
 
-@restricted
-async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Diagnose one link: what does the server really answer?"""
-    msg = update.effective_message
-    state = get_state(update.effective_chat.id)
-    if not context.args:
-        await msg.reply_text("Usage: /test https://example.com/path/image.jpg\n"
-                             "Shows exactly what the server answers for that link, and for a similar link "
-                             "that cannot exist - so you can see why a link is (not) counted as working.")
-        return
-    url = context.args[0].strip()
-    if checker.PLACEHOLDER_RE.search(url):
-        if not state["words"]:
-            await msg.reply_text("That link contains (Word). Send a real link, or upload your wordlist first.")
-            return
-        url = checker.PLACEHOLDER_RE.sub(lambda m: checker.quote_word(state["words"][0]), url)
-    if not url.lower().startswith(("http://", "https://")):
-        await msg.reply_text("Please send a full link starting with http:// or https://")
-        return
-
-    wait = await msg.reply_text("🔬 Testing the link...")
-    try:
-        res = await checker.inspect_url(url)
-    except Exception as e:
-        await wait.edit_text(f"❌ The test failed: {type(e).__name__}: {e}"[:500])
-        return
-
-    def block(label: str, info: dict) -> list[str]:
-        if info.get("error"):
-            return [f"{label}", f"  Error: {info['error']}"]
-        out = [label, f"  HTTP status: {info['status']}"]
-        if info["status"] in (200, 206):
-            out.append(f"  Content-Type: {info['ctype'] or 'not given'}")
-            if info.get("total"):
-                out.append(f"  Size: {fmt_size(info['total'])}")
-            out.append("  Real image: " + (f"yes ({info['kind']}) ✅" if info.get("kind") else "no ❌"))
-            out.append("  Last modified: " + (fmt_bd(info.get("lm")) or "not provided by the server"))
-        return out
-
-    main, ctrl = res["main"], res["control"]
-    lines = ["🔬 Test result", url, ""]
-    lines += block("This link:", main)
-    lines.append("")
-    lines.append(("✅ VERDICT: WORKING — " if res["ok"] else "❌ VERDICT: NOT working — ") + res["reason"])
-    lines.append("")
-    lines.append("Control (a link that certainly does not exist):")
-    lines.append("  " + (ctrl.get("url") or ""))
-    if ctrl.get("error"):
-        lines.append(f"  Error: {ctrl['error']}")
-    else:
-        lines.append(f"  HTTP status: {ctrl['status']}")
-        if ctrl["status"] in (200, 206):
-            lines.append("  ⚠️ The server ALSO returns a file for links that don't exist, so it can't be trusted "
-                         "on status code alone - the bot compares the file itself (done automatically).")
-        else:
-            lines.append("  ✅ The server correctly refuses missing files.")
-    await wait.edit_text("\n".join(lines)[:4000], link_preview_options=NO_PREVIEW)
-
-
-@restricted
-async def found_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-    hist = state["history"]
-
-    if context.args and context.args[0].lower() == "clear":
-        hist.clear()
-        save_history(chat_id)
-        await msg.reply_text("🧹 Found-links history cleared.")
-        return
-    if not hist:
-        await msg.reply_text("Nothing found yet. Working links appear here after a check finds them.")
-        return
-
-    ordered = sorted(hist.items(), key=lambda kv: (lm_epoch(kv[1].get("lm")), kv[1].get("first", 0)), reverse=True)
-    top = ordered[:10]
-    lines = [f"📚 {len(ordered):,} working link(s) found so far. Newest first:", ""]
-    for url, entry in top:
-        lines.append(url)
-        lines.append("   📅 " + (fmt_bd(entry.get("lm")) or "Last modified: not provided"))
-    if len(ordered) > len(top):
-        lines.append(f"\n...and {len(ordered) - len(top):,} more in the file below.")
-    await msg.reply_text("\n".join(lines), link_preview_options=NO_PREVIEW)
-
-    if len(ordered) > len(top):
-        with tempfile.TemporaryDirectory() as tmp:
-            p = Path(tmp) / f"all_found_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            p.write_text("\n".join(result_lines([(u, e.get("lm")) for u, e in ordered])) + "\n", encoding="utf-8")
-            await send_text_file(context.bot, chat_id, p, f"All {len(ordered):,} working links found so far.")
-
-
-@restricted
-async def notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-    state = get_state(chat_id)
-    choice = context.args[0].lower() if context.args else ""
-    if choice not in ("all", "new"):
-        await msg.reply_text(
-            f"Auto-check alerts are set to: {state['notify_mode']}\n\n"
-            "/notify all — message me every time a working link is found, every cycle\n"
-            "/notify new — message me only for links I haven't been told about before")
-        return
-    state["notify_mode"] = choice
-    save_settings(chat_id)
-    await msg.reply_text("✅ Auto-check will alert you every time a working link is found." if choice == "all"
-                         else "✅ Auto-check will alert you only for NEW links (everything is still in /found).")
-
-
-@restricted
+@gated(("check", "addword", "autocheck"), cmd="cancel")
 async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state(update.effective_chat.id)
     msg = update.effective_message
     run = state["run"]
     if run is not None and not run.finished:
         run.cancel()
-        extra = ""
-        if state["run_kind"] == "auto":
-            extra = " (auto-check stays on - use /stopautocheck to turn it off)"
-        await msg.reply_text("🛑 Cancelling..." + extra)
+        extra = "\n<i>Auto-check stays on — use /stopautocheck to turn it off.</i>" if state["run_kind"] == "auto" else ""
+        await say(msg, ui.notice("🛑", "CANCELLING", "Stopping the check… what was found so far is kept." + extra))
     elif run is not None:
-        # checking is over; only the delivery of the individual messages is still going
         state["stop_notify"] = True
-        await msg.reply_text("🛑 Stopped sending the remaining link messages. The results file has every working link.")
+        await say(msg, ui.notice("🛑", "STOPPED SENDING", "The remaining link messages will not be sent.",
+                                 "<i>The results file has every working link.</i>"))
     elif state["busy"]:
         state["pending_cancel"] = True
-        await msg.reply_text("🛑 Cancelling...")
+        await say(msg, ui.notice("🛑", "CANCELLING", "The check will stop as soon as it starts."))
     else:
-        await msg.reply_text("There's no check running right now.")
+        await say(msg, ui.notice("ℹ️", "Nothing to cancel", "No check is running right now."))
 
 
-# ---------------- automatic checking ----------------
+# ---------- /test ----------
+
+_test_urls: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _remember_test_url(url: str) -> str:
+    token = secrets.token_hex(4)
+    _test_urls[token] = url
+    while len(_test_urls) > 300:
+        _test_urls.popitem(last=False)
+    return token
+
+
+def _test_markup(url: str, token: str, with_url_button: bool = True) -> InlineKeyboardMarkup:
+    row = []
+    if with_url_button:
+        row.append(InlineKeyboardButton("🔗 Open link", url=url))
+    row.append(InlineKeyboardButton("🔁 Test again", callback_data=f"tst:{token}"))
+    return InlineKeyboardMarkup([row])
+
+
+async def _run_test(message, chat_id: int, url: str):
+    tz = tz_of(chat_id)
+    try:
+        res = await checker.inspect_url(url)
+    except Exception as e:
+        await edit_card(message, ui.warn("The test failed", f"<code>{ui.e(type(e).__name__)}: {ui.e(str(e)[:300])}</code>"))
+        return
+    stats.add(chat_id, tests=1)
+    token = _remember_test_url(url)
+    text = ui.test_card(url, res, tz)
+    for with_btn in (True, False):          # a link Telegram refuses as a URL button must not break the test
+        try:
+            await message.edit_text(text[:4000], parse_mode=HTML, link_preview_options=NO_PREVIEW,
+                                    reply_markup=_test_markup(url, token, with_btn))
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+        except Exception:
+            logger.exception("test card failed")
+            return
+
+
+@gated("test")
+async def test_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Inspect one link in detail."""
+    msg = update.effective_message
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+    if not context.args:
+        await say(msg, ui.notice("🔬", "LINK TEST", "Usage: <code>/test https://example.com/path/image.jpg</code>",
+                                 "<i>Shows exactly what the server answers for that link — and for a similar link that "
+                                 "cannot exist — so you can see why a link is (not) counted as working.</i>"))
+        return
+    url = context.args[0].strip()
+    if checker.PLACEHOLDER_RE.search(url):
+        if not state["words"]:
+            await say(msg, ui.warn("Link has (Word)", "Send a real link, or upload your wordlist first."))
+            return
+        url = checker.PLACEHOLDER_RE.sub(lambda m: checker.quote_word(state["words"][0]), url)
+    if not url.lower().startswith(("http://", "https://")):
+        await say(msg, ui.warn("Invalid link", "Please send a full link starting with <code>http://</code> or <code>https://</code>."))
+        return
+    wait = await say(msg, ui.notice("🔬", "TESTING…", f"🔗 <code>{ui.e(url)}</code>", "<i>Asking the server…</i>"))
+    await _run_test(wait, chat_id, url)
+
+
+async def test_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = q.from_user
+    if not store.can(user.id, "test"):
+        await q.answer("You don't have permission for /test.", show_alert=True)
+        return
+    url = _test_urls.get(q.data.split(":", 1)[1])
+    if not url:
+        await q.answer("This test is too old. Send /test again.", show_alert=True)
+        return
+    await q.answer("Testing again…")
+    await edit_card(q.message, ui.notice("🔬", "TESTING…", f"🔗 <code>{ui.e(url)}</code>", "<i>Asking the server…</i>"))
+    await _run_test(q.message, q.message.chat.id, url)
+
+
+# ---------- /found, /status, /stats ----------
+
+@gated("found")
+async def found_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+    state = get_state(chat_id)
+    hist = state["history"]
+    tz = tz_of(chat_id)
+
+    if context.args and context.args[0].lower() == "clear":
+        hist.clear()
+        save_history(chat_id)
+        await say(msg, ui.notice("🧹", "HISTORY CLEARED", "Your found-links history is now empty."))
+        return
+    if not hist:
+        await say(msg, ui.notice("📚", "FOUND LINKS", "Nothing found yet.",
+                                 "<i>Working links appear here after a check finds them.</i>"))
+        return
+    ordered = sorted(hist.items(), key=lambda kv: (lm_epoch(kv[1].get("lm")), kv[1].get("first", 0)), reverse=True)
+    top = ordered[:10]
+    more = len(ordered) > len(top)
+    await say(msg, ui.found_card([(u, e.get("lm")) for u, e in top], len(ordered), tz, more))
+    if more:
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / f"all_found_links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            p.write_text("\n".join(result_lines([(u, e.get("lm")) for u, e in ordered], tz)) + "\n", encoding="utf-8")
+            await send_text_file(context.bot, chat_id, p, f"📎 All {len(ordered):,} working links found so far · {tz.label}")
+
+
+@gated("status")
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+    total = checker.count_combinations(state["links"], state["words"])
+    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}") if context.job_queue else ()
+    run = state["run"]
+    snap = run.snapshot() if run is not None and not run.finished else None
+    await say(update.effective_message,
+              ui.status_card(state, total, MAX_COMBINATIONS, bool(jobs), tz_of(chat_id), snap, state["run_kind"]))
+
+
+@gated("status")
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    data = stats.get(chat.id)
+    glob = stats.get("global")["today"] if store.is_admin(update.effective_user.id) else None
+    await say(update.effective_message, ui.stats_card(data["today"], data["yesterday"], tz_of(chat.id), glob))
+
+
+@admin_only()
+async def resetstats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    stats.reset(update.effective_chat.id)
+    await say(update.effective_message, ui.notice("🧹", "STATS RESET", "Today's statistics for this chat were cleared.",
+                                                  "<i>They also reset by themselves every day at 04:00 AM Bangladesh Time.</i>"))
+
+
+# ---------- notify / autocheck ----------
+
+@gated("autocheck")
+async def notify_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    state = get_state(chat_id)
+    choice = context.args[0].lower() if context.args else ""
+    if choice not in ("all", "new"):
+        await say(update.effective_message, ui.notice(
+            "🔔", "AUTO-CHECK ALERTS", f"Currently: <b>{ui.e(state['notify_mode'])}</b>", "",
+            "<code>/notify all</code> — message me every time a working link is found, every cycle",
+            "<code>/notify new</code> — message me only for links I haven't been told about before"))
+        return
+    state["notify_mode"] = choice
+    save_settings(chat_id)
+    await say(update.effective_message, ui.notice(
+        "✅", "ALERTS UPDATED",
+        "Auto-check will alert you <b>every time</b> a working link is found." if choice == "all"
+        else "Auto-check will alert you <b>only for NEW links</b> (everything stays in /found)."))
+
 
 async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
     state = get_state(chat_id)
     if state["busy"]:
-        state["skipped_cycles"] += 1          # previous check still running - never overlap
+        stats.add(chat_id, skipped=1)          # previous check still running - never overlap
         return
     if _check_ready(state):
         return
@@ -1128,121 +1246,94 @@ async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
-    """Status update every 30 minutes while autocheck is on."""
     chat_id = context.job.chat_id
     state = get_state(chat_id)
-    last = (datetime.fromtimestamp(state["last_run_time"]).strftime("%Y-%m-%d %H:%M:%S")
-            if state["last_run_time"] else "not yet")
-    lines = [
-        "📡 <b>Autocheck status update</b>",
-        f"Checking every: <code>{state['interval_minutes']}</code> min · alerts: <b>{state['notify_mode']}</b>",
-        f"Cycles completed: <code>{state['cycles_run']}</code>",
-        f"Last check: {last}",
-        f"Last check: <code>{state['last_run_checked']:,}</code> links, "
-        f"<code>{state['last_run_working']:,}</code> working, "
-        f"<code>{state['last_run_unverified']:,}</code> unverified",
-        f"Working links in history: <code>{len(state['history']):,}</code>",
-    ]
     run = state["run"]
-    if run is not None and not run.finished:
-        s = run.snapshot()
-        eta = fmt_dur(s["eta"]) if s["eta"] is not None else "calculating"
-        lines.append(
-            f"⏳ Current cycle: {s['processed']:,}/{s['total']:,} "
-            f"({s['processed'] * 100 / max(1, s['total']):.1f}%), time left ~{eta}, "
-            f"working found so far {s['found']:,}"
-        )
-    else:
-        lines.append("Current cycle: waiting for the next run")
-    lines.append("Still running ✅")
-    await context.bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=HTML)
+    snap = run.snapshot() if run is not None and not run.finished else None
+    today = stats.get(chat_id)["today"]
+    await context.bot.send_message(chat_id=chat_id, text=ui.heartbeat_card(state, today, tz_of(chat_id), snap),
+                                   parse_mode=HTML)
 
 
 def schedule_autocheck(job_queue, chat_id: int, minutes: int, first: int = 5):
     for name in (f"check-{chat_id}", f"heartbeat-{chat_id}"):
         for job in job_queue.get_jobs_by_name(name):
             job.schedule_removal()
-    job_queue.run_repeating(autocheck_job, interval=minutes * 60, first=first,
-                            chat_id=chat_id, name=f"check-{chat_id}")
+    job_queue.run_repeating(autocheck_job, interval=minutes * 60, first=first, chat_id=chat_id, name=f"check-{chat_id}")
     job_queue.run_repeating(heartbeat_job, interval=HEARTBEAT_SECONDS, first=HEARTBEAT_SECONDS,
                             chat_id=chat_id, name=f"heartbeat-{chat_id}")
 
 
-@restricted
+@gated("autocheck")
 async def autocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     msg = update.effective_message
     state = get_state(chat_id)
 
     if not context.args:
-        await msg.reply_text(
-            f"Usage: /autocheck N   (N = minutes, {MIN_AUTOCHECK_MINUTES} to {MAX_AUTOCHECK_MINUTES})\n"
-            "Example: /autocheck 5"
-        )
+        await say(msg, ui.notice("🔁", "AUTO-CHECK", f"Usage: <code>/autocheck N</code>  (N = minutes, "
+                                 f"{MIN_AUTOCHECK_MINUTES}–{MAX_AUTOCHECK_MINUTES})", "Example: <code>/autocheck 5</code>"))
         return
     try:
         minutes = int(context.args[0])
     except ValueError:
-        await msg.reply_text("Please give a whole number of minutes, e.g. /autocheck 5")
+        await say(msg, ui.warn("Invalid number", "Please give a whole number of minutes, e.g. <code>/autocheck 5</code>"))
         return
     if not (MIN_AUTOCHECK_MINUTES <= minutes <= MAX_AUTOCHECK_MINUTES):
-        await msg.reply_text(f"⏱ Please choose between {MIN_AUTOCHECK_MINUTES} and {MAX_AUTOCHECK_MINUTES} minutes.")
+        await say(msg, ui.warn("Out of range", f"Please choose between <b>{MIN_AUTOCHECK_MINUTES}</b> and <b>{MAX_AUTOCHECK_MINUTES}</b> minutes."))
         return
     problem = _check_ready(state)
     if problem:
-        await msg.reply_text(problem)
+        await say(msg, problem)
         return
 
     state["interval_minutes"] = minutes
-    state["cycles_run"] = 0
-    state["skipped_cycles"] = 0
     save_settings(chat_id)
     schedule_autocheck(context.job_queue, chat_id, minutes)
-    mode_note = ("every working link every cycle" if state["notify_mode"] == "all"
-                 else "only NEW links (change with /notify all)")
-    await msg.reply_text(
-        f"✅ Auto-check enabled: every {minutes} minute(s) I re-check every link with every word.\n"
-        f"Alerts: {mode_note}. Status update every 30 minutes. It resumes by itself if the bot restarts.\n"
-        "If a check takes longer than the interval, the next one waits (checks never overlap)."
-    )
+    await say(msg, ui.autocheck_on_card(minutes, state["notify_mode"]))
 
 
-@restricted
+@gated("autocheck")
 async def stopautocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = get_state(chat_id)
     msg = update.effective_message
-    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}") + \
-        context.job_queue.get_jobs_by_name(f"heartbeat-{chat_id}")
+    jobs = context.job_queue.get_jobs_by_name(f"check-{chat_id}") + context.job_queue.get_jobs_by_name(f"heartbeat-{chat_id}")
     if not jobs and not state["interval_minutes"]:
-        await msg.reply_text("Auto-check isn't running right now.")
+        await say(msg, ui.notice("ℹ️", "Auto-check is off", "It isn't running right now."))
         return
-    for job in jobs:
-        job.schedule_removal()
-    state["interval_minutes"] = None
-    save_settings(chat_id)
+    await stop_autocheck_for(context, chat_id)
     run = state["run"]
     if run is not None and not run.finished and state["run_kind"] == "auto":
         run.cancel()
-    await msg.reply_text("🛑 Auto-check and status updates stopped.")
+    await say(msg, ui.notice("🛑", "AUTO-CHECK OFF", "Automatic checking and status updates are stopped."))
 
 
-# ---------------- uploads ----------------
+# ---------- uploads ----------
 
 async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat, msg = update.effective_chat, update.effective_message
-    if chat is None or msg is None or msg.document is None or not is_allowed(chat.id):
-        return  # stay silent in chats that are not allowed
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat is None or user is None or msg is None or msg.document is None:
+        return
+    private = is_private(chat)
     doc = msg.document
     name = (doc.file_name or "").lower()
     kind = "words" if "wordlist" in name else "links" if "linklist" in name else None
-    if kind is None:
-        if chat.type == "private":
-            await msg.reply_text("📄 Please send files named wordlist.txt and linklist.txt.")
-        return
+    if private:
+        if kind is None:
+            if store.can(user.id, UPLOAD_PERMS):
+                await say(msg, ui.notice("📄", "Unknown file", "Please send files named <code>wordlist.txt</code> and "
+                                         "<code>linklist.txt</code>."))
+            return
+        if not await gate(update, context, UPLOAD_PERMS, "upload"):    # approval, permission, country - same as commands
+            return
+    else:
+        if kind is None or not group_allowed(chat.id) or not store.can(user.id, UPLOAD_PERMS):
+            return                                  # stay silent in groups
+        store.touch(user)
     if doc.file_size and doc.file_size > MAX_UPLOAD_BYTES:
-        await msg.reply_text("⚠️ That file is bigger than 20 MB, which is Telegram's limit for bots. "
-                             "Please split it into smaller files.")
+        await say(msg, ui.warn("File too big", "That file is bigger than <b>20 MB</b>, Telegram's limit for bots.",
+                               "<i>Please split it into smaller files.</i>"))
         return
 
     state = get_state(chat.id)
@@ -1254,32 +1345,354 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         items, skipped = await asyncio.to_thread(checker.read_lines, dest)
     except Exception:
         logger.exception("Could not read uploaded file")
-        await msg.reply_text("❌ I couldn't download or read that file. Please try sending it again.")
+        await say(msg, ui.warn("Upload failed", "I couldn't download or read that file.", "<i>Please try sending it again.</i>"))
         return
 
     state[kind] = items
     label = "word(s)" if kind == "words" else "link(s)"
-    text = f"✅ Loaded {len(items):,} {label} from {filename}"
+    lines = [f"📥 Loaded <b>{len(items):,}</b> {label} from <code>{filename}</code>"]
     if skipped:
-        text += f" ({skipped:,} blank/duplicate line(s) skipped)"
+        lines.append(f"<i>{skipped:,} blank/duplicate line(s) skipped</i>")
     if kind == "links" and items and not any(checker.PLACEHOLDER_RE.search(x) for x in items):
-        text += "\n⚠️ None of your links contain (Word) - each link will just be checked once."
-    await msg.reply_text(text)
-
+        lines.append("⚠️ None of your links contain <code>(Word)</code> — each link will just be checked once.")
     if state["words"] and state["links"]:
         total = checker.count_combinations(state["links"], state["words"])
-        note = f"Both files loaded: {len(state['links']):,} links × {len(state['words']):,} words = {total:,} combinations."
-        if total > MAX_COMBINATIONS:
-            note += f"\n⚠️ That is more than the limit of {MAX_COMBINATIONS:,} per run."
-        else:
-            note += "\nSend /check when you're ready! 🚀"
-        await msg.reply_text(note)
+        lines += ["", f"🔗 <code>{len(state['links']):,}</code> links × 📝 <code>{len(state['words']):,}</code> words = <b>{total:,}</b> combinations"]
+        lines.append(f"⚠️ <i>That is more than the limit of {MAX_COMBINATIONS:,} per run.</i>" if total > MAX_COMBINATIONS
+                     else "<i>Ready — send /check 🚀</i>")
+    await say(msg, ui.notice("✅", "FILE LOADED", *lines))
 
 
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat and user and msg and is_private(chat) and store.can(user.id, None) and store.has_tz(user.id):
+        await say(msg, ui.notice("🤔", "Not sure what you mean", "<i>Try /help to see what I can do.</i>"))
+
+
+# ============================================================
+# ADMIN: users, permissions, groups, broadcast
+# ============================================================
+
+USERS_PER_PAGE = 8
+
+
+def users_page(page: int) -> tuple[str, list[list[tuple[str, str]]]]:
+    users = [dict(r, status="admin") if store.is_admin(r["id"]) else r for r in store.sorted_users()]
+    users.sort(key=lambda r: 0 if r["status"] == "admin" else 1)       # admins first (sort is stable)
+    pages = max(1, (len(users) + USERS_PER_PAGE - 1) // USERS_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = users[page * USERS_PER_PAGE:(page + 1) * USERS_PER_PAGE]
+    counts = {}
+    for r in users:
+        counts[r["status"]] = counts.get(r["status"], 0) + 1
+    rows, row = [], []
+    for rec in chunk:
+        row.append((f"⚙️ {rec['name'][:18]}", f"perm:menu:{rec['id']}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    if pages > 1:
+        rows.append([("◀️", f"usr:p:{max(0, page - 1)}"), (f"{page + 1}/{pages}", f"usr:p:{page}"),
+                     ("▶️", f"usr:p:{min(pages - 1, page + 1)}")])
+    return ui.users_card(chunk, page, pages, len(users), counts), rows
+
+
+@admin_only(private_only=True)
+async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not store.users:
+        await say(update.effective_message, ui.notice("👥", "USERS", "No users yet.",
+                                                      "<i>People appear here when they send /start.</i>"))
+        return
+    text, rows = users_page(0)
+    await say(update.effective_message, text, kb(rows) if rows else None)
+
+
+async def users_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not store.is_admin(q.from_user.id):
+        await q.answer("Admins only.", show_alert=True)
+        return
+    await q.answer()
+    text, rows = users_page(int(q.data.split(":")[2]))
+    await edit_card(q.message, text, kb(rows) if rows else None)
+
+
+def panel(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    rec = store.ensure(uid)
+    return (ui.perm_panel_text(rec, store.status(uid), store.access_text(uid)), kb(ui.perm_buttons(uid, rec)))
+
+
+def _find_user_arg(text: str) -> dict | None:
+    rec = store.find(text)
+    if rec is None and text.strip().lstrip("-").isdigit():
+        rec = store.ensure(int(text))
+    return rec
+
+
+@admin_only(private_only=True)
+async def user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not context.args:
+        await say(msg, ui.notice("🎛", "USER PANEL", "Usage: <code>/user ID</code> or <code>/user @username</code>",
+                                 "<i>Opens the permission panel. Use /users to see everyone.</i>"))
+        return
+    rec = _find_user_arg(context.args[0])
+    if rec is None:
+        await say(msg, ui.warn("User not found", "That user has never written to the bot. Use their numeric ID."))
+        return
+    text, markup = panel(rec["id"])
+    await say(msg, text, markup)
+
+
+@admin_only(private_only=True)
+async def grant_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if len(context.args) < 2:
+        await say(msg, ui.notice("🎁", "GRANT ACCESS",
+                                 "<code>/grant ID all</code> — every command",
+                                 "<code>/grant ID test found</code> — only these commands",
+                                 "",
+                                 "<i>Commands: " + ui.e(" ".join("/" + k for k in PERMISSIONS)) + "</i>"))
+        return
+    rec = _find_user_arg(context.args[0])
+    if rec is None:
+        await say(msg, ui.warn("User not found", "Use the user's numeric ID."))
+        return
+    uid = rec["id"]
+    if context.args[1].lower() == "all":
+        store.approve_all(uid)
+    else:
+        keys, bad = parse_perm_words(context.args[1:])
+        if bad or not keys:
+            await say(msg, ui.warn("Unknown command(s)", f"<code>{ui.e(' '.join(bad) or '?')}</code>",
+                                   "<i>Valid: " + ui.e(" ".join("/" + k for k in PERMISSIONS)) + "</i>"))
+            return
+        store.set_commands(uid, keys)
+    await say(msg, ui.notice("✅", "ACCESS SAVED", f"👤 <b>{ui.who(rec)}</b> · <code>{uid}</code>",
+                             f"🎛 <b>{ui.e(store.access_text(uid))}</b>"))
+    await notify_user(context.bot, uid, ui.access_changed_card(rec, "The admin updated your access.", store.access_text(uid)))
+    await enforce_permissions(context, uid)
+
+
+@admin_only(private_only=True)
+async def revoke_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not context.args:
+        await say(msg, ui.notice("🚫", "REVOKE ACCESS", "<code>/revoke ID</code> — block the user completely",
+                                 "<code>/revoke ID test found</code> — remove only these commands"))
+        return
+    rec = _find_user_arg(context.args[0])
+    if rec is None:
+        await say(msg, ui.warn("User not found", "Use the user's numeric ID."))
+        return
+    uid = rec["id"]
+    if store.is_admin(uid):
+        await say(msg, ui.warn("Can't do that", "This user is an admin (set in .env)."))
+        return
+    if len(context.args) == 1:
+        store.deny(uid)
+        await notify_user(context.bot, uid, ui.denied_card())
+    else:
+        keys, bad = parse_perm_words(context.args[1:])
+        if bad or not keys:
+            await say(msg, ui.warn("Unknown command(s)", f"<code>{ui.e(' '.join(bad) or '?')}</code>"))
+            return
+        store.revoke(uid, keys)
+        await notify_user(context.bot, uid, ui.access_changed_card(rec, "The admin updated your access.", store.access_text(uid)))
+    await say(msg, ui.notice("✅", "ACCESS UPDATED", f"👤 <b>{ui.who(rec)}</b> · <code>{uid}</code>",
+                             f"🎛 <b>{ui.e(store.access_text(uid))}</b>"))
+    await enforce_permissions(context, uid)
+
+
+async def perm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not store.is_admin(q.from_user.id):
+        await q.answer("Only the admin can do this.", show_alert=True)
+        return
+    parts = q.data.split(":")                   # perm:<action>:<uid>[:<cmd>]
+    action, uid = parts[1], int(parts[2])
+    rec = store.ensure(uid)
+    if store.is_admin(uid) and action in ("t", "all", "no"):
+        await q.answer("That user is an admin.", show_alert=True)
+        return
+
+    if action == "menu":
+        await q.answer()
+    elif action == "t" and parts[3] in PERMISSIONS:
+        on = store.toggle(uid, parts[3])
+        await q.answer(f"/{parts[3]} {'ON' if on else 'OFF'}")
+        await enforce_permissions(context, uid)
+    elif action == "all":
+        store.approve_all(uid)
+        await q.answer("Full access given ✅")
+        await notify_user(context.bot, uid, ui.access_changed_card(rec, "Welcome! The admin approved you.", store.access_text(uid)))
+    elif action == "no":
+        store.deny(uid)
+        await q.answer("User blocked ⛔")
+        await notify_user(context.bot, uid, ui.denied_card())
+        await enforce_permissions(context, uid)
+    elif action == "ok":
+        await q.answer("Saved ✅")
+        if store.status(uid) == "approved":
+            await notify_user(context.bot, uid, ui.access_changed_card(rec, "The admin updated your access.", store.access_text(uid)))
+        await edit_card(q.message, ui.notice("✅", "SAVED", f"👤 <b>{ui.who(rec)}</b> · <code>{uid}</code>",
+                                             f"🎛 <b>{ui.e(store.access_text(uid))}</b>"))
+        return
+    text, markup = panel(uid)
+    await edit_card(q.message, text, markup)
+
+
+# ---------- groups ----------
+
+@admin_only()
+async def allow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat, msg = update.effective_chat, update.effective_message
-    if chat and msg and chat.type == "private" and is_allowed(chat.id):
-        await msg.reply_text("Not sure what you mean - try /help.")
+    target = chat.id
+    if context.args:
+        try:
+            target = int(context.args[0])
+        except ValueError:
+            await say(msg, ui.notice("🔓", "ALLOW", "Usage: <code>/allow</code> (this group) or <code>/allow -1001234567890</code>",
+                                     "<i>A positive ID gives that user full access.</i>"))
+            return
+    if target > 0:
+        store.approve_all(target)
+        await say(msg, ui.notice("✅", "USER ALLOWED", f"User <code>{target}</code> now has <b>full access</b>.",
+                                 "<i>Use /user to limit them to some commands.</i>"))
+        await notify_user(context.bot, target, ui.access_changed_card(store.ensure(target), "The admin approved you.", "Full access"))
+        return
+    if group_allowed(target):
+        await say(msg, ui.notice("ℹ️", "Already allowed", f"Group <code>{target}</code> is already allowed ✅"))
+        return
+    dynamic_groups.add(target)
+    _save_groups()
+    await say(msg, ui.notice("✅", "GROUP ALLOWED", f"Group <code>{target}</code> can now use the bot.",
+                             "<i>Members still need the admin's approval to use commands.</i>"))
+
+
+@admin_only()
+async def disallow_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, msg = update.effective_chat, update.effective_message
+    target = chat.id
+    if context.args:
+        try:
+            target = int(context.args[0])
+        except ValueError:
+            await say(msg, ui.notice("🔒", "DISALLOW", "Usage: <code>/disallow</code> (this group) or <code>/disallow -1001234567890</code>"))
+            return
+    if target > 0:
+        if store.is_admin(target):
+            await say(msg, ui.warn("Can't do that", "This user is an admin (set in .env)."))
+            return
+        store.deny(target)
+        await say(msg, ui.notice("⛔", "USER BLOCKED", f"User <code>{target}</code> is blocked."))
+        await enforce_permissions(context, target)
+        return
+    if target in ENV_GROUPS:
+        await say(msg, ui.warn("Set in .env", "That group is listed in <code>ALLOWED_CHAT_IDS</code>.", "<i>Remove it there and restart the bot.</i>"))
+        return
+    if target not in dynamic_groups:
+        await say(msg, ui.notice("ℹ️", "Not in the list", "That group wasn't added with /allow."))
+        return
+    dynamic_groups.discard(target)
+    _save_groups()
+    await say(msg, ui.notice("🗑", "GROUP REMOVED", f"Group <code>{target}</code> was removed."))
+
+
+@admin_only()
+async def allowed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    env_list = ", ".join(str(i) for i in sorted(ENV_GROUPS)) or "none"
+    dyn_list = ", ".join(str(i) for i in sorted(dynamic_groups)) or "none"
+    admins = ", ".join(str(i) for i in sorted(ADMIN_IDS)) or "none"
+    await say(update.effective_message, ui.notice("🔐", "ALLOWED",
+                                                  f"👑 Admins: <code>{ui.e(admins)}</code>",
+                                                  f"👥 Groups from .env: <code>{ui.e(env_list)}</code>",
+                                                  f"➕ Groups added with /allow: <code>{ui.e(dyn_list)}</code>",
+                                                  "<i>Use /users to manage people.</i>"))
+
+
+# ---------- broadcast ----------
+
+_broadcasts: dict[str, dict] = {}
+
+
+@admin_only(private_only=True)
+async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    raw = msg.text or ""
+    parts = raw.split(None, 1)
+    text = parts[1].strip() if len(parts) > 1 else ""
+    reply = msg.reply_to_message
+    if not text and reply is None:
+        await say(msg, ui.notice("📢", "BROADCAST", "<code>/broadcast Your message here</code>",
+                                 "<i>Or reply to any message with</i> <code>/broadcast</code> <i>to copy it to everyone.</i>",
+                                 "<i>You'll see a preview and must confirm before anything is sent.</i>"))
+        return
+    targets = [r["id"] for r in store.users.values() if r["status"] != "denied"]
+    for a in store.admin_ids:
+        if a not in targets:
+            targets.append(a)
+    if not targets:
+        await say(msg, ui.warn("No users", "Nobody has started the bot yet."))
+        return
+    token = secrets.token_hex(4)
+    _broadcasts[token] = {"admin": user.id, "text": text,
+                          "reply": (chat.id, reply.message_id) if reply is not None else None, "targets": targets}
+    while len(_broadcasts) > 20:
+        _broadcasts.pop(next(iter(_broadcasts)))
+    await say(msg, ui.broadcast_preview(text, len(targets), reply is not None),
+              kb([[(f"✅ Send to {len(targets):,} user(s)", f"bc:ok:{token}"), ("✖ Cancel", f"bc:no:{token}")]]))
+
+
+async def _do_broadcast(bot, msg, job: dict):
+    t0 = time.monotonic()
+    sent = failed = 0
+    targets = job["targets"]
+    for k, uid in enumerate(targets, 1):
+        for attempt in range(2):
+            try:
+                if job["reply"]:
+                    await bot.copy_message(chat_id=uid, from_chat_id=job["reply"][0], message_id=job["reply"][1])
+                else:
+                    await bot.send_message(chat_id=uid, text=ui.announcement(job["text"]), parse_mode=HTML,
+                                           link_preview_options=NO_PREVIEW)
+                sent += 1
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(retry_seconds(e))
+            except Exception:
+                failed += 1
+                break
+        else:
+            failed += 1
+        if k % 25 == 0:
+            await edit_card(msg, ui.notice("📢", "SENDING…", f"<code>{k:,}</code> / <code>{len(targets):,}</code>",
+                                           f"✅ {sent:,} · ❌ {failed:,}"))
+        await asyncio.sleep(0.06)           # stay well under Telegram's 30 messages/second limit
+    await edit_card(msg, ui.broadcast_report(sent, failed, len(targets), time.monotonic() - t0))
+
+
+async def broadcast_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if not store.is_admin(q.from_user.id):
+        await q.answer("Only the admin can do this.", show_alert=True)
+        return
+    _, action, token = q.data.split(":")
+    job = _broadcasts.pop(token, None)
+    if job is None:
+        await q.answer("This broadcast expired.", show_alert=True)
+        return
+    if action == "no":
+        await q.answer("Cancelled")
+        await edit_card(q.message, ui.notice("✖", "BROADCAST CANCELLED", "Nothing was sent."))
+        return
+    await q.answer("Sending…")
+    await edit_card(q.message, ui.notice("📢", "SENDING…", f"<code>0</code> / <code>{len(job['targets']):,}</code>"))
+    task = asyncio.create_task(_do_broadcast(context.bot, q.message, job))
+    task.add_done_callback(_log_task_result)
+    _broadcasts.setdefault("_tasks", {})[token] = task        # keep a reference
 
 
 # ============================================================
@@ -1293,7 +1706,8 @@ async def restore_autocheck(app: Application):
         if not d.is_dir() or not name.lstrip("-").isdigit():
             continue
         chat_id = int(name)
-        if not is_allowed(chat_id):
+        allowed = group_allowed(chat_id) if chat_id < 0 else store.can(chat_id, "autocheck")
+        if not allowed:
             continue
         state = get_state(chat_id)
         minutes = state["interval_minutes"]
@@ -1303,29 +1717,44 @@ async def restore_autocheck(app: Application):
             continue
         schedule_autocheck(app.job_queue, chat_id, minutes, first=15)
         try:
-            await app.bot.send_message(chat_id=chat_id, text=f"♻️ Auto-check resumed after the restart: every {minutes} minute(s).")
+            await app.bot.send_message(chat_id=chat_id, parse_mode=HTML, text=ui.notice(
+                "♻️", "AUTO-CHECK RESUMED", f"The bot restarted — auto-check is back on: every <b>{minutes}</b> minute(s)."))
         except Exception:
             logger.info("Could not tell chat %s that auto-check resumed", chat_id)
 
 
+async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
+    """04:00 Bangladesh time: start a new statistics day for everybody."""
+    stats.rollover_all()
+    logger.info("Daily statistics reset done")
+
+
+BASE_COMMANDS = [
+    ("start", "Welcome & setup"), ("help", "All your commands"), ("check", "Check all links with all words"),
+    ("cancel", "Cancel the running check"), ("addword", "Add words & check only those"), ("test", "Inspect one link"),
+    ("found", "Links found so far"), ("autocheck", "Re-check automatically"), ("status", "Live status"),
+    ("stats", "Today's statistics"), ("country", "Change country / time zone"), ("id", "Show IDs"),
+]
+ADMIN_COMMANDS = [("users", "Users & permissions"), ("user", "Open a user's panel"), ("grant", "Give access"),
+                  ("revoke", "Remove access"), ("broadcast", "Message every user"), ("allow", "Allow a group"),
+                  ("allowed", "List allowed groups")]
+
+
 async def post_init(app: Application):
     try:
-        await app.bot.set_my_commands([
-            BotCommand("start", "Welcome message"),
-            BotCommand("help", "How to use the bot"),
-            BotCommand("check", "Check all links with all words"),
-            BotCommand("cancel", "Cancel the running check"),
-            BotCommand("addword", "Add words and check only those"),
-            BotCommand("test", "Diagnose one link"),
-            BotCommand("found", "All working links found so far"),
-            BotCommand("autocheck", "Re-check automatically (1-10 min)"),
-            BotCommand("notify", "Auto-check alerts: all or new"),
-            BotCommand("stopautocheck", "Stop automatic checking"),
-            BotCommand("status", "Show status"),
-            BotCommand("id", "Show this chat's ID"),
-        ])
+        await app.bot.set_my_commands([BotCommand(c, d) for c, d in BASE_COMMANDS])
+        for admin in store.admin_ids:
+            try:
+                await app.bot.set_my_commands([BotCommand(c, d) for c, d in BASE_COMMANDS + ADMIN_COMMANDS],
+                                              scope=BotCommandScopeChat(chat_id=admin))
+            except Exception:
+                pass
     except Exception:
         logger.warning("Could not set the command menu", exc_info=True)
+    try:
+        app.job_queue.run_daily(daily_reset_job, time=dtime(hour=C.RESET_HOUR, minute=0, tzinfo=C.BD_TZ), name="daily-reset")
+    except Exception:
+        logger.warning("Could not schedule the daily reset", exc_info=True)
     try:
         await restore_autocheck(app)
     except Exception:
@@ -1333,19 +1762,30 @@ async def post_init(app: Application):
 
 
 async def post_stop(app: Application):
-    # Make sure no checker worker process is left running.
     for state in chat_state.values():
         run = state.get("run")
         if run is not None:
             run.shutdown()
 
 
+async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
+    logger.error("Unhandled error", exc_info=context.error)
+    try:
+        if isinstance(update, Update) and update.effective_message is not None and not isinstance(context.error, (NetworkError, TimedOut)):
+            if not throttled(("err", update.effective_chat.id if update.effective_chat else 0), 20):
+                await update.effective_message.reply_text(
+                    ui.warn("Something went wrong", "<i>Please try again in a moment.</i>"), parse_mode=HTML)
+    except Exception:
+        pass
+
+
 def main():
     if not BOT_TOKEN:
         raise SystemExit("BOT_TOKEN is not set. Put it in a .env file or as an environment variable.\n"
                          "Get a token from @BotFather on Telegram.")
-    if not ENV_ALLOWED and not dynamic_allowed:
-        logger.warning("ALLOWED_CHAT_IDS is empty - nobody can use the bot until you set it.")
+    if not ADMIN_IDS:
+        logger.warning("No admin configured! Put your own Telegram user ID in ALLOWED_CHAT_IDS (or ADMIN_IDS) "
+                       "in .env - without an admin nobody can be approved.")
 
     app = (
         ApplicationBuilder()
@@ -1357,24 +1797,24 @@ def main():
         .build()
     )
 
-    app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("check", check_cmd))
-    app.add_handler(CommandHandler(["cancel", "cancle"], cancel_cmd))
-    app.add_handler(CommandHandler("addword", addword_cmd))
-    app.add_handler(CommandHandler("test", test_cmd))
-    app.add_handler(CommandHandler("found", found_cmd))
-    app.add_handler(CommandHandler("autocheck", autocheck_cmd))
-    app.add_handler(CommandHandler("stopautocheck", stopautocheck_cmd))
-    app.add_handler(CommandHandler("notify", notify_cmd))
-    app.add_handler(CommandHandler("resetstats", resetstats_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("id", id_cmd))
-    app.add_handler(CommandHandler("allow", allow_cmd))
-    app.add_handler(CommandHandler("disallow", disallow_cmd))
-    app.add_handler(CommandHandler("allowed", allowed_cmd))
+    for name, fn in [
+        ("start", start_cmd), ("help", help_cmd), ("id", id_cmd), ("country", country_cmd),
+        ("check", check_cmd), (["cancel", "cancle"], cancel_cmd), ("addword", addword_cmd), ("test", test_cmd),
+        ("found", found_cmd), ("status", status_cmd), ("stats", stats_cmd),
+        ("autocheck", autocheck_cmd), ("stopautocheck", stopautocheck_cmd), ("notify", notify_cmd),
+        ("users", users_cmd), ("user", user_cmd), ("grant", grant_cmd), ("revoke", revoke_cmd),
+        ("broadcast", broadcast_cmd), ("allow", allow_cmd), ("disallow", disallow_cmd), ("allowed", allowed_cmd),
+        ("resetstats", resetstats_cmd),
+    ]:
+        app.add_handler(CommandHandler(name, fn))
+    app.add_handler(CallbackQueryHandler(country_cb, pattern=r"^cty:"))
+    app.add_handler(CallbackQueryHandler(perm_cb, pattern=r"^perm:"))
+    app.add_handler(CallbackQueryHandler(users_cb, pattern=r"^usr:"))
+    app.add_handler(CallbackQueryHandler(broadcast_cb, pattern=r"^bc:"))
+    app.add_handler(CallbackQueryHandler(test_cb, pattern=r"^tst:"))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_text))
+    app.add_error_handler(on_error)
 
     logger.info("Python Url Checker bot is starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

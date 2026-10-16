@@ -156,55 +156,69 @@ def iter_urls(links: list[str], words: list[str]):
 # WORKER SIDE (runs inside "python checker.py --worker")
 # ============================================================
 
-async def _get(session, url: str, headers):
-    """One request. Returns (outcome, status)."""
-    async with session.get(url, headers=headers, allow_redirects=True, max_redirects=5) as resp:
-        status = resp.status
-        ctype = (resp.headers.get("Content-Type") or "").lower()
-        clen = resp.headers.get("Content-Length")
-        clen_n = int(clen) if clen is not None and clen.isdigit() else None
-
-        if status in (200, 206):
-            # Some CDNs answer a missing file with a 200 "not found" web page.
-            outcome = NO if ctype.startswith("text/html") else OK
-        elif status in RETRY_STATUSES:
-            outcome = RETRY
-        elif headers is not None and status in RANGE_UNSUPPORTED:
-            outcome = RANGE_BAD
-        else:
-            outcome = NO
-
-        # Read small bodies completely so the keep-alive connection can be
-        # reused for the next URL (this is a big part of the speed).
-        if outcome == OK:
-            drain = clen_n is not None and clen_n <= 65536
-        else:
-            drain = clen_n is None or clen_n <= 1_000_000
-        if drain:
-            try:
-                await resp.read()
-            except Exception:
-                pass
-        return outcome, status
+REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+DRAIN_LIMIT = 65536
 
 
-async def _probe(session, url: str, st) -> int:
+def _congestion(st):
+    """The server pushed back (429 / 5xx / timeouts): use fewer simultaneous connections."""
+    now = time.monotonic()
+    if now - st.last_cut >= 0.3:
+        st.last_cut = now
+        st.limit = max(st.min_limit, int(st.limit * 0.7))
+        st.successes = 0
+
+
+def _success(st):
+    """Clean answers: slowly allow more simultaneous connections again."""
+    st.successes += 1
+    if st.successes >= 100:
+        st.successes = 0
+        if st.limit < st.max_limit:
+            st.limit = min(st.max_limit, st.limit + max(2, st.max_limit // 40))
+
+
+def image_size(buf: bytes) -> tuple[int, int] | None:
+    """(width, height) read from the first bytes of a JPEG / PNG / GIF / WEBP, if possible."""
     try:
-        outcome, status = await _get(session, url, RANGE_HEADERS)
-        if outcome == RANGE_BAD:  # server doesn't like Range -> plain GET
-            outcome, status = await _get(session, url, None)
-            if outcome == RANGE_BAD:
-                outcome = NO
-        if status == 429:  # server asks us to slow down -> brief global pause
-            st.cooldown_until = max(st.cooldown_until, time.monotonic() + 1.0 + random.random())
-        return outcome
-    except asyncio.CancelledError:
-        raise
-    except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
-        return NO
+        if buf[:8] == b"\x89PNG\r\n\x1a\n":
+            w, h = int.from_bytes(buf[16:20], "big"), int.from_bytes(buf[20:24], "big")
+        elif buf[:6] in (b"GIF87a", b"GIF89a"):
+            w, h = int.from_bytes(buf[6:8], "little"), int.from_bytes(buf[8:10], "little")
+        elif buf[:3] == b"\xff\xd8\xff":
+            w = h = 0
+            i = 2
+            while i + 9 < len(buf):
+                if buf[i] != 0xFF:
+                    break
+                marker = buf[i + 1]
+                if marker == 0xFF:
+                    i += 1
+                    continue
+                if marker in (0xD8, 0x01) or 0xD0 <= marker <= 0xD7:
+                    i += 2
+                    continue
+                seg = int.from_bytes(buf[i + 2:i + 4], "big")
+                if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+                    h, w = int.from_bytes(buf[i + 5:i + 7], "big"), int.from_bytes(buf[i + 7:i + 9], "big")
+                    break
+                i += 2 + seg
+        elif buf[:4] == b"RIFF" and buf[8:12] == b"WEBP":
+            kind = buf[12:16]
+            if kind == b"VP8 ":
+                w, h = int.from_bytes(buf[26:28], "little") & 0x3FFF, int.from_bytes(buf[28:30], "little") & 0x3FFF
+            elif kind == b"VP8L":
+                bits = int.from_bytes(buf[21:25], "little")
+                w, h = (bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1
+            elif kind == b"VP8X":
+                w, h = 1 + int.from_bytes(buf[24:27], "little"), 1 + int.from_bytes(buf[27:30], "little")
+            else:
+                return None
+        else:
+            return None
     except Exception:
-        # timeout, connection reset, DNS hiccup, ... -> NOT "not found"
-        return RETRY
+        return None
+    return (w, h) if w > 0 and h > 0 else None
 
 
 def _total_size(resp) -> int | None:
@@ -219,9 +233,83 @@ def _total_size(resp) -> int | None:
     return None
 
 
+def _clen(resp) -> int | None:
+    cl = resp.headers.get("Content-Length")
+    return int(cl) if cl is not None and cl.isdigit() else None
+
+
+async def _drain(resp, clen_n):
+    """Read a SMALL body completely so the keep-alive connection can be reused
+    for the next link (a big part of the speed). Big bodies are never read."""
+    try:
+        if clen_n is not None:
+            if clen_n <= DRAIN_LIMIT:
+                await resp.read()
+            return
+        got = 0
+        while got <= DRAIN_LIMIT:
+            chunk = await resp.content.read(16384)
+            if not chunk:
+                return
+            got += len(chunk)
+    except Exception:
+        pass
+
+
+async def _get(session, url: str, headers, st):
+    """The fast first look at a link (one tiny request). Returns (outcome, status).
+
+    Outcome OK here only means "looks like a hit - verify it strictly". Answers that are
+    identical to what the server returns for a made-up link (same size/ETag/date, or the
+    same redirect target) are rejected right here, without a second request."""
+    async with session.get(url, headers=headers, allow_redirects=False) as resp:
+        status = resp.status
+        clen_n = _clen(resp)
+        if status in (200, 206):
+            ctype = (resp.headers.get("Content-Type") or "").lower()
+            if ctype.startswith("text/html"):
+                outcome = NO
+            else:
+                sig = (_total_size(resp), resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+                outcome = NO if sig in st.base_sigs else OK
+        elif status in REDIRECT_STATUSES:
+            loc = resp.headers.get("Location") or ""
+            outcome = NO if loc and loc in st.base_redirects else OK   # OK: strict check follows it
+        elif status in RETRY_STATUSES:
+            outcome = RETRY
+        elif headers is not None and status in RANGE_UNSUPPORTED:
+            outcome = RANGE_BAD
+        else:
+            outcome = NO
+        await _drain(resp, clen_n)
+        return outcome, status
+
+
+async def _probe(session, url: str, st) -> int:
+    try:
+        outcome, status = await _get(session, url, RANGE_HEADERS, st)
+        if outcome == RANGE_BAD:  # server doesn't like Range -> plain GET
+            outcome, status = await _get(session, url, None, st)
+            if outcome == RANGE_BAD:
+                outcome = NO
+        if outcome == RETRY:
+            _congestion(st)
+        else:
+            _success(st)
+        return outcome
+    except asyncio.CancelledError:
+        raise
+    except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
+        return NO
+    except Exception:
+        # timeout, connection reset, DNS hiccup, ... -> NOT "not found"
+        _congestion(st)
+        return RETRY
+
+
 async def _fetch_head(session, url: str) -> dict:
-    """GET the first 4 KB of a file. Returns status, headers we care about
-    and the first bytes (used to prove it is a real image)."""
+    """GET the first 4 KB of a file (following redirects). Returns status, the headers we
+    care about and the first bytes (used to prove it is a real image)."""
     for headers in (RANGE_HEAD, None):
         async with session.get(url, headers=headers, allow_redirects=True, max_redirects=5) as resp:
             status = resp.status
@@ -234,6 +322,10 @@ async def _fetch_head(session, url: str) -> dict:
                 "total": _total_size(resp),
                 "head": b"",
                 "final": str(resp.url),
+                "server": resp.headers.get("Server"),
+                "etag": resp.headers.get("ETag"),
+                "cdn": (resp.headers.get("X-Cache") or resp.headers.get("CF-Cache-Status")
+                        or resp.headers.get("X-Cache-Status") or resp.headers.get("Via")),
             }
             if status in (200, 206):
                 buf = bytearray()
@@ -265,8 +357,7 @@ async def _verify(session, url: str, st):
     info = await _fetch_head(session, url)
     status = info["status"]
     if status in RETRY_STATUSES:
-        if status == 429:
-            st.cooldown_until = max(st.cooldown_until, time.monotonic() + 1.0 + random.random())
+        _congestion(st)
         return RETRY, None
     if status not in (200, 206):
         return NO, None
@@ -283,10 +374,10 @@ async def _verify(session, url: str, st):
 
 
 async def _learn_baseline(session, links: list[str], st):
-    """Ask each link pattern for a word that certainly doesn't exist and remember
-    what the server answers. If it answers with a file (placeholder image / page),
-    real hits are later told apart from it."""
-    templates = [l for l in links if PLACEHOLDER_RE.search(l)][:300]
+    """Ask each link pattern for a word that certainly doesn't exist and remember what the
+    server answers (a placeholder file / a redirect to a default picture). Real hits are
+    later told apart from it - cheaply, by size/ETag/date or redirect target."""
+    templates = [l for l in links if PLACEHOLDER_RE.search(l)][:60]
     if not templates:
         return
     sem = asyncio.Semaphore(20)
@@ -296,31 +387,45 @@ async def _learn_baseline(session, links: list[str], st):
         async with sem:
             for attempt in range(3):
                 try:
-                    info = await _fetch_head(session, url)
+                    # (a) exactly what the fast first look will see for such a link
+                    async with session.get(url, headers=RANGE_HEADERS, allow_redirects=False) as resp:
+                        status = resp.status
+                        loc = resp.headers.get("Location") or ""
+                        sig = (_total_size(resp), resp.headers.get("ETag"), resp.headers.get("Last-Modified"))
+                        await _drain(resp, _clen(resp))
+                    if status in RETRY_STATUSES:
+                        await asyncio.sleep(0.5)
+                        continue
+                    if status in REDIRECT_STATUSES:
+                        st.soft404 = True
+                        if loc:
+                            st.base_redirects.add(loc)
+                    elif status in (200, 206):
+                        st.soft404 = True
+                        if sig[0] is not None and (sig[1] or sig[2]):
+                            st.base_sigs.add(sig)
+                    # (b) the strict fingerprint (follows redirects, looks at the file itself)
+                    if status in REDIRECT_STATUSES or status in (200, 206):
+                        info = await _fetch_head(session, url)
+                        if info["status"] in (200, 206):
+                            st.baseline.add(_fingerprint(info))
+                    return
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     await asyncio.sleep(0.3 * (attempt + 1))
-                    continue
-                if info["status"] in (200, 206):
-                    st.baseline.add(_fingerprint(info))
-                    st.soft404 = True
-                elif info["status"] in RETRY_STATUSES:
-                    await asyncio.sleep(0.5)
-                    continue
-                return
 
     junks = ["zqx" + os.urandom(4).hex() + "k", "qwv" + os.urandom(4).hex() + "m"]
-    await asyncio.gather(*(one(t, j) for t in templates for j in junks))
+    try:
+        await asyncio.wait_for(asyncio.gather(*(one(t, j) for t in templates for j in junks)), 30)
+    except asyncio.TimeoutError:
+        pass  # never let this hold up the real check
 
 
 async def _check(session, url: str, attempts: int, base_delay: float, st, honor_abort: bool = True):
     """Check one URL, retrying network-type failures.
     Returns (outcome, meta); outcome is NO / OK / RETRY (RETRY = could not verify)."""
     for attempt in range(attempts):
-        wait = st.cooldown_until - time.monotonic()
-        if wait > 0:
-            await asyncio.sleep(wait)
         meta = None
         try:
             outcome = await _probe(session, url, st)       # step 1: cheap look
@@ -331,6 +436,7 @@ async def _check(session, url: str, attempts: int, base_delay: float, st, honor_
         except (aiohttp.InvalidURL, aiohttp.TooManyRedirects):
             return NO, None
         except Exception:
+            _congestion(st)
             outcome = RETRY
         if outcome != RETRY:
             st.consec = 0
@@ -383,9 +489,11 @@ async def _shard(cfg: dict):
     conc, attempts = cfg["concurrency"], cfg["attempts"]
     out = _Out()
     st = SimpleNamespace(
-        processed=0, errors=0, consec=0, abort=False, cooldown_until=0.0,
+        processed=0, errors=0, consec=0, abort=False, exhausted=False,
         abort_after=cfg["abort_after"], phase="main", pending_retry=0,
-        baseline=set(), soft404=False,
+        baseline=set(), base_sigs=set(), base_redirects=set(), soft404=False,
+        # adaptive speed: how many connections the server currently tolerates
+        limit=conc, max_limit=conc, min_limit=max(5, conc // 20), last_cut=0.0, successes=0,
     )
     # This worker's share: every nprocs-th URL, starting at idx.
     urls = itertools.islice(iter_urls(cfg["links"], cfg["words"]), idx, None, nprocs)
@@ -407,11 +515,15 @@ async def _shard(cfg: dict):
 
         await _learn_baseline(session, cfg["links"], st)
 
-        async def first_pass_worker():
-            while not st.abort:
+        async def first_pass_worker(wid: int):
+            while not st.abort and not st.exhausted:
+                if wid >= st.limit:          # the server is pushing back: this worker rests for now
+                    await asyncio.sleep(0.2)
+                    continue
                 try:
                     url = next(urls)
                 except StopIteration:
+                    st.exhausted = True
                     return
                 r, meta = await _check(session, url, attempts, 0.25, st)
                 st.processed += 1
@@ -430,7 +542,7 @@ async def _shard(cfg: dict):
                         url = next(it)
                     except StopIteration:
                         return
-                    r, meta = await _check(session, url, attempts2, 0.5, st, honor_abort=False)
+                    r, meta = await _check(session, url, attempts2, 0.3, st, honor_abort=False)
                     if r == OK:
                         out.emit({"t": "f", "u": url, "m": meta})
                     if r == RETRY:
@@ -441,14 +553,14 @@ async def _shard(cfg: dict):
             return still
 
         async def run_all():
-            await asyncio.gather(*(first_pass_worker() for _ in range(conc)))
+            await asyncio.gather(*(first_pass_worker(i) for i in range(conc)))
             if st.abort:
                 return
             for rnd in range(cfg["final_rounds"]):
                 if not deferred:
                     break
                 st.phase = "retry"
-                await asyncio.sleep(2.0 * (rnd + 1))  # let the network/server cool down
+                await asyncio.sleep(1.5 * (rnd + 1))  # let the network/server cool down
                 items = deferred[:]
                 deferred.clear()
                 st.pending_retry = len(items)
@@ -459,7 +571,7 @@ async def _shard(cfg: dict):
         async def reporter():
             while True:
                 pending = len(deferred) if st.phase == "main" else st.pending_retry
-                out.emit({"t": "p", "i": idx, "n": st.processed, "r": pending, "e": st.errors, "ph": st.phase})
+                out.emit({"t": "p", "i": idx, "n": st.processed, "r": pending, "e": st.errors, "ph": st.phase, "l": st.limit})
                 out.flush()
                 await asyncio.sleep(0.25)
 
@@ -576,6 +688,7 @@ class CheckRun:
         self.cancelled = False
         self.finished = False
         self.nprocs = 0
+        self.per_conc = 0
         self.started: float | None = None
         self.finished_at: float | None = None
 
@@ -622,6 +735,8 @@ class CheckRun:
             "total": self.total, "processed": processed, "found": len(self.found),
             "retrying": retrying, "errors": errors, "speed": speed, "eta": eta,
             "elapsed": self.elapsed(), "in_retry": in_retry, "processes": self.nprocs,
+            "conns": sum(sh.get("l") or 0 for sh in self.shards.values()),
+            "conns_max": self.per_conc * self.nprocs,
         }
 
     # ---------- control ----------
@@ -672,7 +787,8 @@ class CheckRun:
                     limit=4 * 1024 * 1024,
                 )
                 self._procs.append(proc)
-                self.shards[i] = {"n": 0, "r": 0, "e": 0, "done": False}
+                self.shards[i] = {"n": 0, "r": 0, "e": 0, "l": per_conc, "done": False}
+                self.per_conc = per_conc
                 proc.stdin.write((json.dumps(cfg) + "\n").encode("ascii"))
                 await proc.stdin.drain()
                 if self.cancelled:
@@ -741,6 +857,7 @@ class CheckRun:
                     pass
         elif t == "p":
             sh["n"], sh["r"], sh["e"] = msg["n"], msg["r"], msg.get("e", 0)
+            sh["l"] = msg.get("l", sh.get("l"))
         elif t == "d":
             sh.update(n=msg["n"], r=0, e=msg.get("e", 0), done=True)
             self.unverified_count += msg.get("unv", 0)
@@ -787,14 +904,18 @@ def control_url(url: str) -> str:
 
 
 async def _inspect_one(session, url: str) -> dict:
+    t0 = time.monotonic()
     try:
         info = await _fetch_head(session, url)
     except Exception as e:
         return {"url": url, "error": f"{type(e).__name__}: {e}"[:200]}
+    info["ms"] = int((time.monotonic() - t0) * 1000)
     info["url"] = url
     good = info["status"] in (200, 206)
     info["kind"] = sniff_image(info["head"]) if good else None
+    info["dims"] = image_size(info["head"]) if good else None
     info["fp"] = _fingerprint(info) if good else None
+    info["redirected"] = info["final"].rstrip("/") != url.rstrip("/")
     return info
 
 

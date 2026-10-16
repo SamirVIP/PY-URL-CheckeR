@@ -1,126 +1,140 @@
 # Python Url Checker — Telegram Bot
 
-Send the bot a `wordlist.txt` and a `linklist.txt` (links containing a `(Word)` placeholder).
-It tests **every link with every word** — up to **600,000 combinations per run** — and sends you
-each working link **with its image and the date it was uploaded** (Bangladesh time).
-
-Works in private chats **and Telegram groups** (only chats you allow).
+Send the bot a `wordlist.txt` and a `linklist.txt` (links containing a `(Word)` placeholder). It tests
+**every link with every word** — up to **1,000,000 combinations per run** — and sends you each working link
+**with its picture and the date it was uploaded, in your own country's time**.
 
 ## Files
 
 | File | What it is |
 |---|---|
-| `bot.py` | The Telegram bot (run this one) |
-| `checker.py` | The fast checking engine (keep it next to `bot.py`) |
-| `requirements.txt` | Python packages |
-| `.env.example` | Settings template → copy to `.env` |
-| `sample_wordlist.txt`, `sample_linklist.txt` | Example input files |
+| `bot.py` | The Telegram bot — **run this one** |
+| `checker.py` | The fast checking engine |
+| `access.py` | Users, permissions and the daily statistics |
+| `countries.py` | Countries, time zones, time formatting |
+| `ui.py` | Every message the bot sends (one consistent look) |
+| `requirements.txt`, `.env.example` | Packages / settings template |
+
+Keep all `.py` files in the same folder.
 
 ## Setup
 
 1. Create a bot with **@BotFather** → copy the token. Find your own ID with **@userinfobot**.
 2. ```bash
    pip install -r requirements.txt
-   cp .env.example .env      # edit: BOT_TOKEN and ALLOWED_CHAT_IDS
+   cp .env.example .env      # set BOT_TOKEN and put YOUR user ID in ALLOWED_CHAT_IDS
    python bot.py
    ```
+3. **Open your bot and press Start once** — that is how it can send you access requests.
    Keep it running 24/7 with `tmux`/`screen`, `pm2` or a `systemd` service.
 
-## Using it
+## Who can use the bot
 
-1. Send `wordlist.txt` (one word per line) and `linklist.txt` (one link per line) **as files**.
-   `(Word)` marks where the word goes: `https://dl.dir.freefiremobile.com/.../1750x1070_M1917(Word)_en.jpg`
-   (`(word)`/`(WORD)` work too; file names just need to contain `wordlist` / `linklist`; max 20 MB each).
-2. Send `/check`.
+* **You (admin)** — every personal ID in `ALLOWED_CHAT_IDS` / `ADMIN_IDS` — can do everything.
+* **Everybody else needs your approval first.** When someone presses Start they choose their country, and you get a card:
 
-Every working link arrives like this (the picture itself, with this caption):
+  ```
+  🔔 New access request
+  👤 Rahim (@rahim)   🆔 123456789   🌍 🇮🇳 India
+  [✅ Allow all] [🎛 Choose commands] [⛔ Deny]
+  ```
+* **Per-command permissions.** *Choose commands* opens a panel where you tap exactly what the user may do:
+  `/check` (+ uploads, `/cancel`), `/addword`, `/test`, `/found`, `/autocheck` (+ `/stopautocheck`, `/notify`), `/status` (+ `/stats`).
+  Only `/test`? Tap only `/test`. Everything? *Allow all*. The user is told when their access changes, and `/help`
+  shows each user only the commands they have. Taking away access also stops what they had running.
+
+| Admin command | What it does |
+|---|---|
+| `/users` | Everyone, their country and access (tap a name to edit) |
+| `/user ID` | Open one user's permission panel (works for IDs that never wrote to the bot) |
+| `/grant ID all` · `/grant ID test found` | Give access by text |
+| `/revoke ID` · `/revoke ID test` | Block a user · remove some commands |
+| `/broadcast TEXT` | Message every user (see below) |
+| `/allow` · `/disallow` · `/allowed` | Allow / remove a **group** (`/allow ID` with a positive ID gives that user full access) |
+| `/resetstats` | Reset today's statistics for this chat |
+
+User-management commands only work in a private chat with the bot.
+
+## Country and time
+
+On first `/start` every user picks a country (🇧🇩 Bangladesh, 🇮🇳 India, 🇮🇷 Iran, 🇻🇳 Vietnam, 🇱🇰 Sri Lanka, 🇹🇭 Thailand,
+🇧🇷 Brazil … 70 time zones, paged buttons). Not listed? `/country Your Country`, `/country Asia/Dhaka` or `/country UTC+5:30`.
+From then on **every time the bot shows is in that time zone, 12-hour clock**: the file's *Last modified* date, check
+times, status, the statistics reset time. Change it any time with `/country`. In a group the *group admin* sets the
+group's time zone with `/country`.
+
+## Daily statistics
+
+`/stats` shows today's checks, links checked, links found, unverified, best speed, checking time, auto-check cycles,
+tests and alerts, plus yesterday's totals. **Every day at 04:00 AM Bangladesh time the numbers reset** — each user
+sees that moment in *their own* time (for example 03:30 AM in India, 01:30 AM in Iran, 05:00 AM in Vietnam) with a countdown.
+Admins also see the total across all users.
+
+## Broadcast
+
+`/broadcast Your message` (or reply to any message with `/broadcast` to copy it) shows a **preview** and the number of
+recipients; nothing is sent until you press **Send**. Everyone who is not blocked receives it; the report tells you
+how many were delivered and how many failed (users who blocked the bot).
+
+## Using the checker
+
+1. Send `wordlist.txt` (one word per line) and `linklist.txt` (one link per line, `(Word)` marks the word) **as files**
+   (names just need to contain `wordlist` / `linklist`; max 20 MB each).
+2. `/check` — live progress, speed and time left. `/cancel` stops it.
+
+Every working link arrives as its picture with this caption:
 
 ```
 🆕 NEW Working Link Found!
+🔗 Open link
 https://.../1750x1070_M1917ShadowRing_en.jpg
 
-📅 Last modified:
-Mon, 09 Feb 2026 - 12:30 PM (Bangladesh Time)
-📦 Size: 1.4 MB
+📅 Last modified · India Time
+Mon, 09 Feb 2026 - 12:00 PM
+🕒 8 months ago
+
+🖼 JPEG · 1750×1070 px · 📦 1.4 MB
 ```
-
-"Last modified" is the date the server reports for the file — normally when the image was uploaded —
-converted to Bangladesh time (UTC+6, 12-hour clock). If a server doesn't report it, the bot says so.
-
-## Commands
 
 | Command | What it does |
 |---|---|
-| `/check` | Check every link with every word (live progress, speed, time left) |
-| `/cancel` (or `/cancle`) | Stop the running check |
-| `/addword W1 W2 …` | Add words to your list **and instantly check only those words** against all links |
-| `/test LINK` | Diagnose one link: what does the server really answer? (and for a link that can't exist) |
-| `/found` | Every working link found so far, newest first (`/found clear` empties it) |
-| `/autocheck N` | Re-check automatically every N minutes (1–10); resumes by itself after a restart |
-| `/notify all` / `/notify new` | Auto-check alerts: every time, or only for links you haven't been told about |
-| `/stopautocheck` | Stop automatic checking |
-| `/status`, `/resetstats` | Status / clear counters |
-| `/id` | Show this chat's ID |
-| `/allow [id]`, `/disallow [id]`, `/allowed` | (admin) manage allowed chats |
+| `/check` / `/cancel` | Check everything / stop |
+| `/addword W1 W2 …` | Add words and check **only those** against all links |
+| `/test LINK` | Detailed inspection of one link (below) |
+| `/found` | Every working link found so far, newest first (`/found clear`) |
+| `/autocheck N` / `/stopautocheck` | Re-check every N minutes (1–10); resumes after a restart; status update every 30 min |
+| `/notify all` / `/notify new` | Auto-check alerts: every time, or only for new links |
+| `/status`, `/stats` | Live status, daily statistics |
+| `/country`, `/id`, `/help` | Time zone, IDs, your personal command list |
+
+### /test
+
+A premium report for one link: verdict (✅ working / ❌ not working and why), HTTP status with its meaning, content type,
+real image format **and resolution**, size, response time, server/CDN, redirect target, *Last modified* in your time with
+"3 hours ago", and a **server honesty check** (what the server answers for a link that cannot exist). Buttons: 🔗 *Open link*, 🔁 *Test again*.
 
 ## What counts as "working"
 
-A link is only reported when the file is **really there**:
-
-* the server answers 200/206 and it is not a web page, **and**
-* for `.jpg/.jpeg/.png/.gif/.webp` links the file **starts with real image bytes**, **and**
-* it is **not identical to what the server returns for a link that surely doesn't exist**.
-  Before checking, the bot asks each link pattern for a made-up word and remembers the answer.
-  Servers that reply to *every* link with a placeholder picture, an error page or a redirect to a
-  default image can therefore no longer produce fake "working" links.
-
-If a check still finds an abnormal share of "working" links (over 25%), the bot warns you, does not
-add them to `/found`, and suggests `/test` so you can see what the server answers.
-Safety net: at most `MAX_ALERTS_PER_RUN` (default 500) link messages are sent per run; the results
-file always contains all of them.
-
-## How images are delivered
-
-The bot downloads the picture itself and uploads it to Telegram (so it doesn't depend on Telegram
-being able to fetch the link). If Telegram refuses it as a photo (too big / odd shape) it is sent as
-a file; if the picture can't be downloaded, Telegram is asked to fetch it; last resort is the link as
-text. Captions are plain text, so `_` in links is always safe. When a check ends you also get
-`working_links_….txt` (newest file first, with dates).
-
-## Groups
-
-1. Add the bot to your group and send `/id` there → the group ID (negative number).
-2. Allow it: put the ID in `ALLOWED_CHAT_IDS` in `.env` and restart, **or** send `/allow` inside the
-   group as an admin (any personal ID in `ALLOWED_CHAT_IDS`; no restart needed).
-3. To upload files in a group the bot must see them: make the bot a group admin, or in @BotFather
-   run `/setprivacy` → *Disable* (then remove and re-add the bot). Each chat has its own lists.
-
-Everyone in an allowed group can use the bot. Telegram allows ~20 bot messages per minute per group,
-so many finds arrive slower there — nothing is lost (the results file has all of them).
-Anonymous group admins can't use `/allow`; use `.env` instead.
+The file must **really be there**: a real image for `.jpg/.png/.gif/.webp` links, and not identical to what the server
+returns for a link that surely doesn't exist (placeholders, error pages, redirects to a default picture are rejected).
+If an abnormal share (>25%) looks "working", the bot warns you and doesn't save them. Nothing is skipped: network
+errors/429/5xx are retried, and anything still unverified is reported and listed in a file.
 
 ## Speed
 
-Several worker processes (one per CPU core, max 4), `uvloop`/`aiodns` when installed, reused
-connections, and only a few bytes requested per link. Real speed depends mostly on your server and the
-target server — if it starts rejecting you, lower `CONCURRENCY` in `.env`.
+One tiny request per link, several worker processes, automatic speed control when a server rate-limits, `uvloop`/`aiodns`
+when installed, found images downloaded in the background. Real speed depends on your server and the target server.
 
-## Nothing is skipped
+## Groups
 
-* Every link × every word is checked; the summary shows `links × words = total` and `Checked: N`.
-* Network errors, timeouts, HTTP 429/5xx are **never** treated as "not found": they are retried, then
-  re-checked in extra rounds. Anything still unverified is reported (`unverified_links_….txt`).
-* If the server blocks you completely, the run stops early and says so.
-* Blank lines, duplicates, Windows line endings and a UTF-8 BOM are handled.
-
-## Auto-check
-
-`/autocheck 5` re-checks everything every 5 minutes and alerts you when working links are found
-(`/notify` chooses every time or only new ones). A status update arrives every 30 minutes (including the
-progress of a running cycle). Checks never overlap. The setting is saved and restored after a restart.
+1. Add the bot to the group, send `/id` there → the group ID (negative).
+2. Allow it: put the ID in `ALLOWED_CHAT_IDS` and restart, **or** send `/allow` in the group as an admin.
+3. Members still need your approval (users, not groups, get permissions). To upload files in a group make the bot a group
+   admin or disable privacy in @BotFather (`/setprivacy` → Disable). Telegram allows ~20 bot messages per minute per
+   group, so many finds arrive slower there — nothing is lost (a results file has all of them).
 
 ## Troubleshooting
 
-* **Fake or missing results?** Send `/test <one link>`. It shows the HTTP status, content type, whether it
-  is a real image, the last-modified date, and what the server does for a link that can't exist.
-* **Many "could not verify"** → the server is rate-limiting you; lower `CONCURRENCY`.
+* **Nobody gets approval requests** → the admin must press Start in the bot once; the user's next message retries.
+* **Fake or missing results?** `/test <one link>` shows what the server really answers.
+* **Many "could not verify"** → the server is rate-limiting; lower `CONCURRENCY`.

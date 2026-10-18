@@ -98,7 +98,7 @@ def _parse_ids(text: str) -> set[int]:
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGNOUf6kzBESqDYqUpWQWIuFf6iT4K-TCg").strip()
 
 # ALLOWED_CHAT_IDS: personal IDs (positive) are ADMINS; group IDs (negative, -100...) are allowed groups.
-ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961,6641002744,7558493182,8843257178"))
+ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961"))
 ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_IDS", "6206433961")) | {i for i in ENV_ALLOWED if i > 0}
 ENV_GROUPS = {i for i in ENV_ALLOWED if i < 0}
 

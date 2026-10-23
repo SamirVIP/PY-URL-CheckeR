@@ -95,7 +95,7 @@ def _parse_ids(text: str) -> set[int]:
     return ids
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAElT74GD-LRaACB7p5QrKI-hIDP_5ocuT8").strip().strip("\"'").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAGTYrj2d60CfEAW1-VHVWltzrzKM_rnlNs").strip().strip("\"'").strip()
 
 # ALLOWED_CHAT_IDS: personal IDs (positive) are ADMINS; group IDs (negative, -100...) are allowed groups.
 ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961"))

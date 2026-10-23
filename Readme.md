@@ -1,7 +1,7 @@
 # Python Url Checker — Telegram Bot
 
 Send the bot a `wordlist.txt` and a `linklist.txt` (links containing a `(Word)` placeholder). It tests
-**every link with every word** — up to **1,000,000 combinations per run** — and sends you each working link
+**every link with every word** — up to **10,000,000 combinations per run** — and sends you each working link
 **with its picture and the date it was uploaded, in your own country's time**.
 
 ## Files
@@ -14,6 +14,7 @@ Send the bot a `wordlist.txt` and a `linklist.txt` (links containing a `(Word)` 
 | `countries.py` | Countries, time zones, time formatting |
 | `ui.py` | Every message the bot sends (one consistent look) |
 | `requirements.txt`, `.env.example` | Packages / settings template |
+| `Procfile`, `railway.json`, `.python-version` | Make Railway start the bot correctly (Python 3.12) |
 
 Keep all `.py` files in the same folder.
 
@@ -27,6 +28,42 @@ Keep all `.py` files in the same folder.
    ```
 3. **Open your bot and press Start once** — that is how it can send you access requests.
    Keep it running 24/7 with `tmux`/`screen`, `pm2` or a `systemd` service.
+
+## Deploy on Railway
+
+1. Put this folder in a **GitHub repo** (the included `.gitignore` keeps your `.env` out — never upload your token)
+   → Railway → **New Project → Deploy from GitHub repo**. The files must be at the **repo root**.
+2. **Variables** tab — add:
+   * `BOT_TOKEN` = the token from @BotFather
+   * `ALLOWED_CHAT_IDS` = your own Telegram user ID (this makes you the admin)
+   * optional on small plans: `PROCESSES=2` and `CONCURRENCY=500`
+3. **Add a Volume** (service → *Volumes* → *New*) with mount path `/data`.
+   Without it Railway wipes the disk on every deploy, so **approvals, countries and history would be lost**.
+   The bot detects the volume by itself (or set `DATA_DIR=/data`).
+4. Keep **replicas = 1**. Start command is already set by `railway.json` (`python -u bot.py`).
+5. Open the bot in Telegram and press **Start** (so it can send you access requests).
+
+**The first lines of the deploy log tell you if everything is fine:**
+```
+Python 3.12.x ... | CPUs: ...
+python-telegram-bot 21.6 | aiohttp 3.x | uvloop 0.x | tzdata ...
+Data folder: /data
+BOT_TOKEN: set | admins: 1 | allowed groups: 0
+Python Url Checker bot is starting...
+```
+**Test the setup without Telegram:** in Railway's shell run `python bot.py --selfcheck`. It checks the token, the admin ID,
+the data folder and that the checker worker process starts, and prints `[ ok ]` / `[FAIL]` for each.
+
+| What you see in the log | Meaning / fix |
+|---|---|
+| `BOT_TOKEN is not set` / `looks wrong` | Add / re-copy `BOT_TOKEN` in *Variables* (quotes are fine, spaces are not) |
+| `Unauthorized` / `Telegram rejected BOT_TOKEN` | Token revoked or wrong — copy it again from @BotFather |
+| `Conflict: terminated by other getUpdates request` | **Two copies** of the bot are running (your PC, an old deployment, 2 replicas). Stop the others |
+| `WARNING: running on Railway WITHOUT a Volume` | Add the Volume at `/data` (step 3) |
+| Build fails while installing packages | Set variable `NIXPACKS_PYTHON_VERSION=3.12` (or `RAILPACK_PYTHON_VERSION=3.12`) and redeploy |
+| "No start command" / cannot find `bot.py` | Files must be at the repo root; keep `railway.json` and `Procfile` |
+| Out of memory / restarts during big checks | `PROCESSES=2`, `CONCURRENCY=500`, or a larger plan |
+| `No admin configured` | Put **your own** user ID (positive number) in `ALLOWED_CHAT_IDS` |
 
 ## Who can use the bot
 

@@ -3,7 +3,7 @@ Python Url Checker - Telegram Bot
 ==================================
 
 Send the bot two files (wordlist.txt, linklist.txt) and /check tests EVERY link with
-EVERY word - up to 1,000,000 combinations per run - and sends each working link with
+EVERY word - up to 10,000,000 combinations per run - and sends each working link with
 its picture and "Last modified" date in the user's own country time.
 
 Who can use it
@@ -42,7 +42,7 @@ from telegram import (
     Update,
 )
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, TimedOut
+from telegram.error import BadRequest, Forbidden, InvalidToken, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -85,8 +85,8 @@ def _env_float(name: str, default: float) -> float:
 
 def _parse_ids(text: str) -> set[int]:
     ids = set()
-    for part in text.replace(";", ",").split(","):
-        part = part.strip()
+    for part in text.replace(";", ",").replace("\n", ",").split(","):
+        part = part.strip().strip("\"'").strip()
         if part:
             try:
                 ids.add(int(part))
@@ -95,17 +95,37 @@ def _parse_ids(text: str) -> set[int]:
     return ids
 
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAElT74GD-LRaACB7p5QrKI-hIDP_5ocuT8").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8593278400:AAElT74GD-LRaACB7p5QrKI-hIDP_5ocuT8").strip().strip("\"'").strip()
 
 # ALLOWED_CHAT_IDS: personal IDs (positive) are ADMINS; group IDs (negative, -100...) are allowed groups.
 ENV_ALLOWED = _parse_ids(os.environ.get("ALLOWED_CHAT_IDS", "6206433961"))
 ADMIN_IDS = _parse_ids(os.environ.get("ADMIN_IDS", "6206433961")) | {i for i in ENV_ALLOWED if i > 0}
 ENV_GROUPS = {i for i in ENV_ALLOWED if i < 0}
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "data"))
-DATA_DIR.mkdir(exist_ok=True)
+ON_RAILWAY = bool(os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"))
+VOLUME_PATH = os.environ.get("RAILWAY_VOLUME_MOUNT_PATH", "").strip()
 
-MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 1_000_000)   # per run
+
+def _pick_data_dir() -> tuple[Path, str]:
+    """DATA_DIR if set, else the Railway volume if one is attached, else ./data.
+    If the chosen folder can't be written, fall back to ./data instead of crashing."""
+    wanted = os.environ.get("DATA_DIR", "").strip() or VOLUME_PATH or "data"
+    for candidate in (wanted, "data"):
+        try:
+            path = Path(candidate)
+            path.mkdir(parents=True, exist_ok=True)
+            probe = path / ".write_test"
+            probe.write_text("ok")
+            probe.unlink()
+            return path, (f"{candidate} (fallback: {wanted!r} is not writable)" if candidate != wanted else candidate)
+        except OSError:
+            continue
+    raise SystemExit("Cannot write to any data folder. Set DATA_DIR to a writable folder.")
+
+
+DATA_DIR, DATA_DIR_NOTE = _pick_data_dir()
+
+MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 10_000_000)   # per run
 CONCURRENCY = _env_int("CONCURRENCY", 1000)                  # maximum simultaneous requests (auto-adjusts)
 PROCESSES = _env_int("PROCESSES", 0) or None                 # 0 = automatic
 CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 8.0)
@@ -1779,13 +1799,78 @@ async def on_error(update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
-def main():
+def startup_report() -> list[str]:
+    """What the logs show first - makes deployment problems easy to spot."""
+    import platform
+    from importlib import metadata
+
+    def ver(name):
+        try:
+            return metadata.version(name)
+        except Exception:
+            return "not installed"
+    lines = [
+        f"Python {platform.python_version()} on {platform.system()} | CPUs: {os.cpu_count()}",
+        f"python-telegram-bot {ver('python-telegram-bot')} | aiohttp {ver('aiohttp')} | uvloop {ver('uvloop')} | tzdata {ver('tzdata')}",
+        f"Data folder: {DATA_DIR_NOTE}",
+        f"BOT_TOKEN: {'set' if BOT_TOKEN else 'MISSING'} | admins: {len(ADMIN_IDS)} | allowed groups: {len(ENV_GROUPS)}",
+        f"Limits: {MAX_COMBINATIONS:,} combinations, up to {CONCURRENCY} connections, workers: {PROCESSES or 'auto'}",
+    ]
+    if ON_RAILWAY and not (VOLUME_PATH or os.environ.get("DATA_DIR")):
+        lines.append("WARNING: running on Railway WITHOUT a Volume - approvals, countries and history are lost on every "
+                     "redeploy. Add a Volume mounted at /data (see README).")
+    return lines
+
+
+async def _selfcheck() -> int:
+    """python bot.py --selfcheck : tests the setup without talking to Telegram."""
+    import sys as _sys
+    ok = True
+    print("== Python Url Checker self-check ==")
+    for line in startup_report():
+        print(" ", line)
     if not BOT_TOKEN:
-        raise SystemExit("BOT_TOKEN is not set. Put it in a .env file or as an environment variable.\n"
-                         "Get a token from @BotFather on Telegram.")
+        print("  [FAIL] BOT_TOKEN is not set (Railway > Variables)"); ok = False
+    else:
+        print("  [ ok ] BOT_TOKEN is set")
+    if not ADMIN_IDS:
+        print("  [FAIL] no admin: put your Telegram user ID in ALLOWED_CHAT_IDS"); ok = False
+    else:
+        print(f"  [ ok ] admin IDs: {sorted(ADMIN_IDS)}")
+    # can we start a checker worker process?
+    try:
+        proc = await asyncio.create_subprocess_exec(_sys.executable, str(checker.CHECKER_PATH), "--worker",
+                                                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        cfg = dict(idx=0, nprocs=1, concurrency=5, links=["http://127.0.0.1:9/(Word)"], words=["x"], outdir=str(DATA_DIR),
+                   connect_timeout=2.0, total_timeout=3.0, attempts=1, final_rounds=0, abort_after=100)
+        proc.stdin.write((json.dumps(cfg) + "\n").encode()); await proc.stdin.drain()
+        out = await asyncio.wait_for(proc.stdout.read(), 20)
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), 5)
+        if b'"t":"d"' in out:
+            print("  [ ok ] checker worker process starts and finishes correctly")
+        else:
+            print("  [FAIL] checker worker gave no result:", out[:200]); ok = False
+    except Exception as e:
+        print(f"  [FAIL] cannot run the checker worker: {type(e).__name__}: {e}"); ok = False
+    print("RESULT:", "everything looks good" if ok else "problems found (see [FAIL] lines)")
+    return 0 if ok else 1
+
+
+def main():
+    import sys as _sys
+    if "--selfcheck" in _sys.argv:
+        raise SystemExit(asyncio.run(_selfcheck()))
+    for line in startup_report():
+        logger.info(line)
+    if not BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN is not set. In Railway: your service > Variables > add BOT_TOKEN "
+                         "(the token from @BotFather). Locally: put it in the .env file.")
+    if ":" not in BOT_TOKEN:
+        raise SystemExit("BOT_TOKEN looks wrong - it must look like 123456789:AAExampleToken... (copy it again from @BotFather).")
     if not ADMIN_IDS:
         logger.warning("No admin configured! Put your own Telegram user ID in ALLOWED_CHAT_IDS (or ADMIN_IDS) "
-                       "in .env - without an admin nobody can be approved.")
+                       "- without an admin nobody can be approved.")
 
     app = (
         ApplicationBuilder()
@@ -1817,7 +1902,11 @@ def main():
     app.add_error_handler(on_error)
 
     logger.info("Python Url Checker bot is starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except InvalidToken:
+        raise SystemExit("Telegram rejected BOT_TOKEN (Unauthorized). Copy the token again from @BotFather "
+                         "(use /token there if needed) and update the BOT_TOKEN variable.")
 
 
 if __name__ == "__main__":

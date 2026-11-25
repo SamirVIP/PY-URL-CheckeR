@@ -20,6 +20,7 @@ Run:  python bot.py   (see README.md)
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -28,6 +29,7 @@ import shutil
 import tempfile
 import time
 from collections import OrderedDict
+from urllib.parse import quote
 from datetime import datetime, time as dtime, timezone
 from functools import wraps
 from pathlib import Path
@@ -128,8 +130,8 @@ DATA_DIR, DATA_DIR_NOTE = _pick_data_dir()
 MAX_COMBINATIONS = _env_int("MAX_COMBINATIONS", 10_000_000)   # per run
 CONCURRENCY = _env_int("CONCURRENCY", 1000)                  # maximum simultaneous requests (auto-adjusts)
 PROCESSES = _env_int("PROCESSES", 0) or None                 # 0 = automatic
-CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 8.0)
-TOTAL_TIMEOUT = _env_float("TOTAL_TIMEOUT", 15.0)
+CONNECT_TIMEOUT = _env_float("CONNECT_TIMEOUT", 6.0)
+TOTAL_TIMEOUT = _env_float("TOTAL_TIMEOUT", 12.0)
 ATTEMPTS = _env_int("ATTEMPTS", 3)
 
 MAX_ALERTS_PER_RUN = _env_int("MAX_ALERTS_PER_RUN", 500)     # 0 = unlimited (the results file always has ALL)
@@ -184,6 +186,57 @@ def group_allowed(chat_id: int) -> bool:
 # ============================================================
 # TELEGRAM HELPERS
 # ============================================================
+
+EMOJI_FILE = DATA_DIR / "premium_emoji.json"
+PREMIUM_ENABLED = os.environ.get("PREMIUM_EMOJI", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def load_premium():
+    data = {}
+    try:
+        data = json.loads(EMOJI_FILE.read_text(encoding="utf-8")) if EMOJI_FILE.exists() else {}
+    except Exception:
+        logger.warning("Could not read %s", EMOJI_FILE, exc_info=True)
+    if not isinstance(data, dict):
+        data = {}
+    ui.set_premium(data.get("map") or {}, bool(data.get("on", True)) and PREMIUM_ENABLED)
+
+
+def save_premium():
+    try:
+        EMOJI_FILE.write_text(json.dumps({"on": ui.PREMIUM["on"], "map": ui.PREMIUM["map"]}, ensure_ascii=False),
+                              encoding="utf-8")
+    except Exception:
+        logger.exception("Could not save the premium emoji")
+
+
+def install_premium_emoji():
+    """Every HTML message / caption the bot sends or edits passes through ui.premiumize() first.
+    If Telegram ever refuses it, the very same message is sent again with normal emoji - nothing is lost."""
+    from telegram.ext import ExtBot
+
+    def wrap(name: str, field: str):
+        orig = getattr(ExtBot, name)
+
+        @wraps(orig)
+        async def patched(self, *args, **kwargs):
+            text = kwargs.get(field)
+            new = ui.premiumize(text) if isinstance(text, str) and kwargs.get("parse_mode") == HTML else text
+            if new is text or new == text:
+                return await orig(self, *args, **kwargs)
+            try:
+                return await orig(self, *args, **dict(kwargs, **{field: new}))
+            except BadRequest as e:
+                if "not modified" in str(e).lower():
+                    raise
+                logger.info("Premium emoji refused by Telegram (%s) - sending normal emoji", e)
+                return await orig(self, *args, **kwargs)
+        setattr(ExtBot, name, patched)
+
+    for name, field in (("send_message", "text"), ("edit_message_text", "text"), ("send_photo", "caption"),
+                        ("send_document", "caption"), ("edit_message_caption", "caption")):
+        wrap(name, field)
+
 
 def kb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
@@ -281,7 +334,8 @@ def _read_json(path: Path, default):
 def save_settings(chat_id: int):
     st = chat_state[chat_id]
     (chat_dir(chat_id) / "settings.json").write_text(
-        json.dumps({"interval": st["interval_minutes"], "notify": st["notify_mode"]}), encoding="utf-8")
+        json.dumps({"interval": st["interval_minutes"], "notify": st["notify_mode"],
+                    "source": st.get("source", "own"), "speed": st.get("last_speed")}), encoding="utf-8")
 
 
 def save_history(chat_id: int):
@@ -293,16 +347,26 @@ def save_history(chat_id: int):
     (chat_dir(chat_id) / "found_history.json").write_text(json.dumps(hist), encoding="utf-8")
 
 
+def save_blocklist(chat_id: int):
+    (chat_dir(chat_id) / "blocklist.json").write_text(json.dumps(chat_state[chat_id]["blocked"]), encoding="utf-8")
+
+
 def get_state(chat_id: int) -> dict:
     if chat_id not in chat_state:
         d = chat_dir(chat_id)
         settings = _read_json(d / "settings.json", {})
+        blocked = _read_json(d / "blocklist.json", {})
         notify = settings.get("notify", "all")
+        source = settings.get("source", "own")
         chat_state[chat_id] = {
             "words": checker.read_lines(d / "wordlist.txt")[0],
             "links": checker.read_lines(d / "linklist.txt")[0],
             "history": _read_json(d / "found_history.json", {}),
+            "blocked": blocked if isinstance(blocked, dict) else {},     # url -> time blocked
             "notify_mode": notify if notify in ("all", "new") else "all",
+            "source": source if source in ("own", "mena") else "own",    # lists the LAST check used (/autocheck repeats it)
+            "mena_warned": False,
+            "last_speed": settings.get("speed") if isinstance(settings.get("speed"), (int, float)) else None,
             "interval_minutes": settings.get("interval"),
             "run": None,
             "run_kind": None,
@@ -505,8 +569,10 @@ class Notifier:
     Captions are HTML (escaped); if Telegram ever refuses the formatting, a plain caption is used.
     """
 
-    def __init__(self, bot, chat_id: int, mode: str, history: dict, tz: C.TzCtx):
+    def __init__(self, bot, chat_id: int, mode: str, history: dict, tz: C.TzCtx, blocked: dict):
         self.bot, self.chat_id, self.mode, self.history, self.tz = bot, chat_id, mode, history, tz
+        self.blocked = blocked              # live reference: a link blocked mid-run is dropped from the queue too
+        self.suppressed_blocked = 0
         self.pace = NOTIFY_PACE_GROUP if chat_id < 0 else NOTIFY_PACE_PRIVATE
         self.queue: asyncio.Queue = asyncio.Queue()
         self.pending = 0
@@ -515,6 +581,7 @@ class Notifier:
         self.suppressed_cap = 0
         self.suppressed_known = 0
         self.failed: list[str] = []
+        self.delivered: set[str] = set()
         self.parse_error = False
         self.prefetched = 0
         self.prefetch_tasks: set[asyncio.Task] = set()
@@ -527,6 +594,9 @@ class Notifier:
         self.task = asyncio.create_task(self._loop())
 
     def add(self, url: str, meta: dict):
+        if url in self.blocked:
+            self.suppressed_blocked += 1
+            return
         known = url in self.history
         if self.mode == "new" and known:
             self.suppressed_known += 1
@@ -549,9 +619,16 @@ class Notifier:
             url, meta, known, task = await self.queue.get()
             if task is not None:
                 self.prefetched -= 1
+            if url in self.blocked:         # blocklisted while waiting in the queue
+                if task is not None:
+                    task.cancel()
+                self.suppressed_blocked += 1
+                self.pending -= 1
+                continue
             try:
                 if await self.deliver(url, meta, known, task):
                     self.sent += 1
+                    self.delivered.add(url)
                 else:
                     self.failed.append(url)
                 await asyncio.sleep(self.pace)
@@ -607,25 +684,27 @@ class Notifier:
                 return False
         return False
 
-    async def _chain(self, data, url: str, caption: str, filename: str, html: bool) -> bool:
+    async def _chain(self, data, url: str, caption: str, filename: str, html: bool, markup=None) -> bool:
         bot, chat_id = self.bot, self.chat_id
         pm = HTML if html else None
         self.parse_error = False
         if data:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=data, caption=caption, parse_mode=pm)):
+            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=data, caption=caption, parse_mode=pm,
+                                                         reply_markup=markup)):
                 return True
             if self.parse_error:
                 return False
             if await self._try(lambda: bot.send_document(chat_id=chat_id, document=data, filename=filename,
-                                                         caption=caption, parse_mode=pm)):
+                                                         caption=caption, parse_mode=pm, reply_markup=markup)):
                 return True
         else:
-            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode=pm)):
+            if await self._try(lambda: bot.send_photo(chat_id=chat_id, photo=url, caption=caption, parse_mode=pm,
+                                                         reply_markup=markup)):
                 return True
             if self.parse_error:
                 return False
         return await self._try(lambda: bot.send_message(chat_id=chat_id, text=caption, parse_mode=pm,
-                                                        link_preview_options=NO_PREVIEW))
+                                                        link_preview_options=NO_PREVIEW, reply_markup=markup))
 
     async def deliver(self, url: str, meta: dict, known: bool, task=None) -> bool:
         data, lm, size = await (task if task is not None else self._download(url))
@@ -634,10 +713,11 @@ class Notifier:
             kind = checker.sniff_image(data[:16])
             dims = checker.image_size(data[:262144])
         filename = url.split("?", 1)[0].rsplit("/", 1)[-1] or "image.jpg"
+        markup = _alert_markup(_remember_url(url), False)
         for html in (True, False):
             caption = ui.alert_caption(url, lm or meta.get("lm"), size or meta.get("sz"), known, self.tz,
                                        kind, dims, html)
-            if await self._chain(data, url, caption, filename, html):
+            if await self._chain(data, url, caption, filename, html, markup):
                 return True
             if not self.parse_error:
                 break
@@ -675,6 +755,40 @@ async def progress_loop(run: checker.CheckRun, msg, chat_id: int):
             last = text
 
 
+async def send_failed_links(bot, chat_id: int, urls: list[str]) -> bool:
+    """Plain-text fallback for working links that could not be sent with their picture."""
+    if not urls:
+        return True
+    batches, cur, size = [], [], 0
+    for u in urls:
+        line = f"<code>{ui.e(u)}</code>"
+        if cur and size + len(line) > 3300:
+            batches.append(cur)
+            cur, size = [], 0
+        cur.append(line)
+        size += len(line) + 1
+    if cur:
+        batches.append(cur)
+    ok = True
+    for i, batch in enumerate(batches):
+        text = (f"⚠️ <b>{len(urls):,} working link(s) could not be sent with a picture</b>\n\n" if i == 0 else "") + "\n".join(batch)
+        sent = False
+        for _ in range(3):
+            try:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode=HTML, link_preview_options=NO_PREVIEW)
+                sent = True
+                break
+            except RetryAfter as e:
+                await asyncio.sleep(retry_seconds(e))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Could not send the fallback link list")
+                break
+        ok = ok and sent
+    return ok
+
+
 async def send_text_file(bot, chat_id: int, path: Path, caption: str):
     for _ in range(2):
         try:
@@ -692,8 +806,8 @@ async def send_text_file(bot, chat_id: int, path: Path, caption: str):
 # RUNNING A CHECK
 # ============================================================
 
-async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, words_override=None):
-    """One complete check for a chat (kind = "manual" or "auto"). words_override: only these words."""
+async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, words_override=None, links_override=None):
+    """One complete check for a chat (kind = "manual" or "auto"). words_override / links_override: use these lists."""
     state = get_state(chat_id)
     tz = tz_of(chat_id)
     workdir = None
@@ -702,8 +816,9 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
     try:
         workdir = Path(tempfile.mkdtemp(prefix="run_", dir=str(chat_dir(chat_id))))
         words = list(words_override) if words_override is not None else list(state["words"])
+        links = list(links_override) if links_override is not None else list(state["links"])
         run = checker.CheckRun(
-            list(state["links"]), words,
+            links, words,
             workdir=workdir, processes=PROCESSES, concurrency=CONCURRENCY,
             connect_timeout=CONNECT_TIMEOUT, total_timeout=TOTAL_TIMEOUT, attempts=ATTEMPTS,
         )
@@ -714,7 +829,7 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
             run.cancel()
 
         mode = state["notify_mode"] if kind == "auto" else "all"
-        notifier = Notifier(bot, chat_id, mode, state["history"], tz)
+        notifier = Notifier(bot, chat_id, mode, state["history"], tz, state["blocked"])
         if progress_msg is not None:
             ptask = asyncio.create_task(progress_loop(run, progress_msg, chat_id))
 
@@ -737,6 +852,8 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
 
         await notifier.drain(stop_sending, timeout=30)
 
+        found_urls = [u for u in run.found if u not in state["blocked"]]      # blocklisted links never reach history/file
+
         # ---- statistics + history ----
         state["last_run_time"] = time.time()
         state["last_run_checked"] = run.processed
@@ -746,46 +863,44 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
         stats.add(chat_id, checks=1, combos=run.processed, found=len(run.found), unverified=run.unverified_count,
                   seconds=el, best_speed=(run.processed / el if el > 0 else 0),
                   auto_cycles=1 if (kind == "auto" and not run.cancelled) else 0)
-        if run.found and not run.suspicious:
-            now = time.time()
-            for url in run.found:
-                lm = (run.found_meta.get(url) or {}).get("lm")
-                entry = state["history"].setdefault(url, {"first": now, "lm": lm})
-                if lm:
-                    entry["lm"] = lm
+        if run.processed >= 2000 and el > 3 and not run.cancelled:
+            state["last_speed"] = run.processed / el            # used for the "estimated time" on the next start card
             try:
-                save_history(chat_id)
+                save_settings(chat_id)
             except Exception:
-                logger.exception("Could not save history")
-
+                logger.exception("Could not save settings")
         # ---- final report ----
         extra = []
         if notifier.suppressed_cap:
             extra.append(f"Only the first {MAX_ALERTS_PER_RUN} link messages were sent "
                          f"({notifier.suppressed_cap:,} more are in the file).")
+        if notifier.suppressed_blocked:
+            extra.append(f"{notifier.suppressed_blocked:,} blocklisted link(s) were skipped (/blocklist).")
         if notifier.suppressed_known:
             extra.append(f"{notifier.suppressed_known:,} already-known link(s) were not repeated (/notify new).")
         if notifier.pending > 0 and not stop_sending():
             extra.append(f"Still sending {notifier.pending:,} working-link message(s) - "
                          "the file below already contains all of them.")
         summary = ui.summary_card(run, extra, tz)
-        problem = bool(run.aborted or run.crashed or run.errors)
+        problem = bool(run.aborted or run.crashed or run.errors or (kind == "auto" and run.unverified_count))
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
         if kind == "manual":
-            if not await edit_card(progress_msg, summary):
-                await bot.send_message(chat_id=chat_id, text=summary[:4000], parse_mode=HTML)
+            again = kb([[("🔁 Check again", "act:mena" if state.get("source") == "mena" else "act:check"),
+                         ("📚 Found links", "act:found")]])
+            if not await edit_card(progress_msg, summary, again):
+                await bot.send_message(chat_id=chat_id, text=summary[:4000], parse_mode=HTML, reply_markup=again)
         elif problem:
             await bot.send_message(chat_id=chat_id, text=("⚠️ <b>Auto-check problem</b>\n" + summary)[:4000], parse_mode=HTML)
 
-        if run.found and (kind == "manual" or len(run.found) >= AUTO_FILE_THRESHOLD):
+        if found_urls and (kind == "manual" or len(found_urls) >= AUTO_FILE_THRESHOLD):
             p = workdir / f"working_links_{stamp}.txt"
-            lines = result_lines([(u, (run.found_meta.get(u) or {}).get("lm")) for u in run.found], tz)
+            lines = result_lines([(u, (run.found_meta.get(u) or {}).get("lm")) for u in found_urls], tz)
             p.write_text("\n".join(lines) + "\n", encoding="utf-8")
             await send_text_file(bot, chat_id, p,
-                                 f"📎 All {len(run.found):,} working link(s) from this check · newest first · {tz.label}")
+                                 f"📎 All {len(found_urls):,} working link(s) from this check · newest first · {tz.label}")
 
-        if run.unverified_count and kind == "manual":
+        if run.unverified_count:
             p = workdir / f"unverified_links_{stamp}.txt"
             written = run.write_unverified(p)
             note = f"⚠️ {run.unverified_count:,} link(s) could not be verified (network/server errors)."
@@ -794,10 +909,30 @@ async def run_check_session(bot, chat_id: int, kind: str, progress_msg=None, wor
             await send_text_file(bot, chat_id, p, note)
 
         await notifier.drain(stop_sending)
-        stats.add(chat_id, alerts=notifier.sent)
         if notifier.failed:
-            logger.warning("%d link message(s) could not be delivered individually (they are in the results file)",
-                           len(notifier.failed))
+            logger.warning("%d link message(s) could not be delivered individually", len(notifier.failed))
+            if not stop_sending():
+                # never lose a working link: whatever could not go out with its picture goes out as text
+                todo = [u for u in notifier.failed if u not in state["blocked"]]
+                if await send_failed_links(bot, chat_id, todo):
+                    notifier.delivered.update(todo)
+
+        # history = links that really reached the chat (a link cut by the alert cap, a failed send or a
+        # cancelled run stays "new", so /notify new can never swallow it)
+        if found_urls and not run.suspicious:
+            now = time.time()
+            for url in found_urls:
+                if url not in notifier.delivered and url not in state["history"]:
+                    continue
+                lm = (run.found_meta.get(url) or {}).get("lm")
+                entry = state["history"].setdefault(url, {"first": now, "lm": lm})
+                if lm:
+                    entry["lm"] = lm
+            try:
+                save_history(chat_id)
+            except Exception:
+                logger.exception("Could not save history")
+        stats.add(chat_id, alerts=notifier.sent)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -824,24 +959,26 @@ def _log_task_result(task: asyncio.Task):
         logger.error("Background check task failed", exc_info=task.exception())
 
 
-def _start_background_check(context, chat_id: int, progress_msg, words_override=None):
-    task = asyncio.create_task(run_check_session(context.bot, chat_id, "manual", progress_msg, words_override))
+def _start_background_check(context, chat_id: int, progress_msg, words_override=None, links_override=None):
+    task = asyncio.create_task(run_check_session(context.bot, chat_id, "manual", progress_msg, words_override,
+                                                 links_override))
     task.add_done_callback(_log_task_result)
     get_state(chat_id)["task"] = task      # keep a reference so it is never garbage-collected
 
 
-def _check_ready(state: dict, words=None) -> str | None:
+def _check_ready(state: dict, words=None, links=None) -> str | None:
     """HTML error text if a check can't start, else None."""
     words = state["words"] if words is None else words
-    if not words or not state["links"]:
+    links = state["links"] if links is None else links
+    if not words or not links:
         return ui.warn("Files needed", "Please send both <code>wordlist.txt</code> and <code>linklist.txt</code> first.",
                        "<i>Use /help to see how.</i>")
-    total = checker.count_combinations(state["links"], words)
+    total = checker.count_combinations(links, words)
     if total == 0:
         return ui.warn("Nothing to check", "Your lists produce 0 links.")
     if total > MAX_COMBINATIONS:
         return ui.warn("Too many combinations",
-                       f"<b>{total:,}</b> ({len(state['links']):,} links × {len(words):,} words) is more than the "
+                       f"<b>{total:,}</b> ({len(links):,} links × {len(words):,} words) is more than the "
                        f"limit of <b>{MAX_COMBINATIONS:,}</b> per run.",
                        "<i>Split your lists into smaller files, or raise MAX_COMBINATIONS in .env.</i>")
     return None
@@ -1006,6 +1143,10 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     total = checker.count_combinations(state["links"], state["words"])
+    eta = ui.eta_text(total, state.get("last_speed"))
+    if state["source"] != "own":
+        state["source"] = "own"                  # /autocheck now repeats THIS check
+        save_settings(chat_id)
     state["busy"] = True
     state["pending_cancel"] = False
     try:
@@ -1013,6 +1154,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "🚀", "STARTING CHECK",
             f"🔗 <code>{len(state['links']):,}</code> links × 📝 <code>{len(state['words']):,}</code> words "
             f"= <b>{total:,}</b> combinations",
+            *([eta] if eta else []),
             "<i>Preparing workers… send /cancel to stop.</i>"))
     except Exception:
         state["busy"] = False
@@ -1174,6 +1316,277 @@ async def test_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _run_test(q.message, q.message.chat.id, url)
 
 
+# ---------- /checkmena (the lists shipped with the bot) ----------
+
+# Where /checkmena reads its two files from. Set MENA_REPO (e.g. "yourname/your-repo") and the bot downloads
+# wordlist.txt + linklist.txt from GitHub on EVERY /checkmena - push new files and the next run uses them.
+# MENA_REPO empty -> falls back to the two files next to bot.py.
+_repo = os.getenv("MENA_REPO", "").strip()
+for _p in ("https://github.com/", "http://github.com/", "github.com/"):
+    if _repo.lower().startswith(_p):
+        _repo = _repo[len(_p):]
+MENA_REPO = _repo.removesuffix(".git").strip("/")
+MENA_BRANCH = os.getenv("MENA_BRANCH", "main").strip() or "main"
+MENA_DIR = os.getenv("MENA_DIR", "").strip().strip("/")        # optional sub-folder inside the repo
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "").strip()           # only needed if the repo is private
+
+BUNDLE_DIR = Path(__file__).resolve().parent
+MENA_WORDS = BUNDLE_DIR / "wordlist.txt"
+MENA_LINKS = BUNDLE_DIR / "linklist.txt"
+
+
+async def _fetch_github(name: str) -> bytes:
+    path = f"{MENA_DIR}/{name}" if MENA_DIR else name
+    tries = [
+        (f"https://api.github.com/repos/{MENA_REPO}/contents/{quote(path)}?ref={quote(MENA_BRANCH)}",
+         {"Accept": "application/vnd.github.raw+json"}),
+        (f"https://raw.githubusercontent.com/{MENA_REPO}/{quote(MENA_BRANCH)}/{quote(path)}?t={int(time.time())}", {}),
+    ]
+    base = {"User-Agent": "python-url-checker-bot"}
+    if GITHUB_TOKEN:
+        base["Authorization"] = f"token {GITHUB_TOKEN}"
+    last = "unknown error"
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
+        for url, extra in tries:
+            try:
+                async with sess.get(url, headers={**base, **extra}) as r:
+                    if r.status == 200:
+                        data = await r.read()
+                        if len(data) > MAX_UPLOAD_BYTES:
+                            raise RuntimeError(f"{name} is bigger than 20 MB")
+                        return data
+                    last = f"HTTP {r.status}"
+            except asyncio.CancelledError:
+                raise
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last = type(e).__name__
+    raise RuntimeError(f"{name}: {last}")
+
+
+def _parse_list(raw: bytes) -> list[str]:
+    with tempfile.TemporaryDirectory() as tmp:
+        f = Path(tmp) / "list.txt"
+        f.write_bytes(raw)
+        return checker.read_lines(f)[0]
+
+
+async def _load_mena_lists() -> tuple[list[str], list[str], str]:
+    """(words, links, where they came from)."""
+    if MENA_REPO:
+        w_raw, l_raw = await asyncio.gather(_fetch_github("wordlist.txt"), _fetch_github("linklist.txt"))
+        return _parse_list(w_raw), _parse_list(l_raw), f"GitHub · {MENA_REPO}@{MENA_BRANCH}"
+    words = (await asyncio.to_thread(checker.read_lines, MENA_WORDS))[0]
+    links = (await asyncio.to_thread(checker.read_lines, MENA_LINKS))[0]
+    return words, links, "bot folder"
+
+
+@gated("check")
+async def checkmena_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check the wordlist.txt + linklist.txt from the GitHub repo (MENA_REPO) - not the user's own uploads."""
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+    state = get_state(chat_id)
+
+    if state["busy"]:
+        await say(msg, ui.warn("Already running", "A check is already running.", "<i>Use /cancel to stop it first.</i>"))
+        return
+    try:
+        words, links, source = await _load_mena_lists()
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        hint = ("<i>Check MENA_REPO / MENA_BRANCH. A private repo also needs GITHUB_TOKEN.</i>" if MENA_REPO
+                else "<i>Set MENA_REPO, or keep both files next to bot.py.</i>")
+        await say(msg, ui.warn("Could not load the lists", f"<code>{ui.e(str(e)[:200])}</code>", hint))
+        return
+    if not words or not links:
+        await say(msg, ui.warn("Lists are empty", f"Source: <code>{ui.e(source)}</code>",
+                               "<i>Both <code>wordlist.txt</code> and <code>linklist.txt</code> need at least one line.</i>"))
+        return
+    problem = _check_ready(state, words, links)
+    if problem:
+        await say(msg, problem)
+        return
+
+    total = checker.count_combinations(links, words)
+    eta = ui.eta_text(total, state.get("last_speed"))
+    if state["source"] != "mena":
+        state["source"] = "mena"                 # /autocheck now repeats THIS check (lists re-loaded every cycle)
+        save_settings(chat_id)
+    state["busy"] = True
+    state["pending_cancel"] = False
+    try:
+        progress_msg = await say(msg, ui.notice(
+            "🚀", "STARTING CHECKMENA",
+            f"🔗 <code>{len(links):,}</code> links × 📝 <code>{len(words):,}</code> words = <b>{total:,}</b> combinations",
+            f"📡 <code>{ui.e(source)}</code>",
+            *([eta] if eta else []),
+            "<i>Your own lists are untouched · /autocheck N repeats this check · /cancel to stop.</i>"))
+    except Exception:
+        state["busy"] = False
+        raise
+    _start_background_check(context, chat_id, progress_msg, words_override=words, links_override=links)
+
+
+# ---------- blocklist ----------
+
+BLK_PAGE = 8
+_url_by_hash: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _uh(url: str) -> str:
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
+def _remember_url(url: str) -> str:
+    h = _uh(url)
+    _url_by_hash[h] = url
+    _url_by_hash.move_to_end(h)
+    while len(_url_by_hash) > 5000:
+        _url_by_hash.popitem(last=False)
+    return h
+
+
+def _resolve_url(chat_id: int, h: str) -> str | None:
+    """Button data carries only a hash (64-byte limit). Works after a restart too, via blocklist/history."""
+    url = _url_by_hash.get(h)
+    if url:
+        return url
+    st = get_state(chat_id)
+    for u in list(st["blocked"]) + list(st["history"]):
+        if _uh(u) == h:
+            return u
+    return None
+
+
+def _alert_markup(h: str, blocked: bool) -> InlineKeyboardMarkup:
+    if blocked:
+        return kb([[("↩️ Remove from blocklist", f"blk:u:{h}")]])
+    return kb([[("🚫 Put in blocklist", f"blk:a:{h}")]])
+
+
+def blocklist_view(chat_id: int, page: int) -> tuple[str, InlineKeyboardMarkup | None]:
+    items = list(get_state(chat_id)["blocked"])
+    if not items:
+        return ui.notice("🚫", "BLOCKLIST", "Your blocklist is empty.",
+                         "<i>Press 🚫 Put in blocklist under a found link and it will never be sent again.</i>"), None
+    pages = (len(items) + BLK_PAGE - 1) // BLK_PAGE
+    page = min(max(page, 0), pages - 1)
+    start = page * BLK_PAGE
+    chunk = items[start:start + BLK_PAGE]
+    lines = [f"{start + i + 1}. <code>{ui.e(u)}</code>" for i, u in enumerate(chunk)]
+    rows = []
+    btns = [(f"🗑 {start + i + 1}", f"blk:r:{_uh(u)}:{page}") for i, u in enumerate(chunk)]
+    for k in range(0, len(btns), 4):
+        rows.append(btns[k:k + 4])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(("⬅️", f"blk:p:{page - 1}"))
+        nav.append((f"{page + 1}/{pages}", "blk:n"))
+        if page < pages - 1:
+            nav.append(("➡️", f"blk:p:{page + 1}"))
+        rows.append(nav)
+    rows.append([("🧹 Clear all", "blk:c")])
+    text = ui.notice("🚫", f"BLOCKLIST · {len(items):,}", *lines, "", "<i>Tap 🗑 + number to remove a link from the blocklist.</i>")
+    return text, kb(rows)
+
+
+@gated(UPLOAD_PERMS, cmd="blocklist")
+async def blocklist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+    if context.args and context.args[0].lower() == "all":
+        if not store.is_admin(update.effective_user.id):
+            await say(msg, ui.warn("Admins only", "Only an admin can block every sent link at once."))
+            return
+        state = get_state(chat_id)
+        urls = list(state["history"])                      # every link that was sent so far
+        run = state["run"]
+        if run is not None:
+            urls += list(run.found)                        # + what the running check has found already
+        now = time.time()
+        added = 0
+        for u in dict.fromkeys(urls):
+            if u not in state["blocked"]:
+                state["blocked"][u] = now
+                added += 1
+        state["history"].clear()
+        save_blocklist(chat_id)
+        save_history(chat_id)
+        await say(msg, ui.notice(
+            "🚫", "ALL SENT LINKS BLOCKED", f"<b>{added:,}</b> link(s) added to the blocklist "
+            f"(<b>{len(state['blocked']):,}</b> in total).", "",
+            "From now on the bot only sends links that are <b>new</b>.",
+            "<i>/blocklist shows them and lets you remove any.</i>"))
+        return
+    text, markup = blocklist_view(chat_id, 0)
+    await say(msg, text, markup)
+
+
+async def blk_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.message is None:
+        await q.answer()
+        return
+    if not store.can(q.from_user.id, UPLOAD_PERMS):
+        await q.answer("You don't have permission for this.", show_alert=True)
+        return
+    chat_id = q.message.chat.id
+    state = get_state(chat_id)
+    parts = q.data.split(":")
+    act = parts[1] if len(parts) > 1 else ""
+
+    async def set_markup(markup):
+        try:
+            await q.edit_message_reply_markup(reply_markup=markup)
+        except BadRequest:
+            pass
+
+    async def show(page: int):
+        text, markup = blocklist_view(chat_id, page)
+        await edit_card(q.message, text, markup)
+
+    if act in ("a", "u", "r"):
+        url = _resolve_url(chat_id, parts[2]) if len(parts) > 2 else None
+        if not url:
+            await q.answer("This button is too old. Use /blocklist.", show_alert=True)
+            return
+        if act == "a":
+            state["blocked"][url] = time.time()
+            state["history"].pop(url, None)
+            save_blocklist(chat_id)
+            save_history(chat_id)
+            await q.answer("🚫 Blocklisted - it will never be sent again")
+            await set_markup(_alert_markup(parts[2], True))
+        elif act == "u":
+            state["blocked"].pop(url, None)
+            save_blocklist(chat_id)
+            await q.answer("↩️ Removed from blocklist")
+            await set_markup(_alert_markup(parts[2], False))
+        else:
+            state["blocked"].pop(url, None)
+            save_blocklist(chat_id)
+            await q.answer("Removed from blocklist ✅")
+            await show(int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0)
+    elif act == "p":
+        await q.answer()
+        await show(int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0)
+    elif act == "c":
+        await q.answer()
+        await edit_card(q.message, ui.notice("🧹", "CLEAR BLOCKLIST", f"Remove all <b>{len(state['blocked']):,}</b> blocked link(s)?"),
+                        kb([[("✅ Yes, clear all", "blk:cy"), ("↩️ Cancel", "blk:p:0")]]))
+    elif act == "cy":
+        state["blocked"].clear()
+        save_blocklist(chat_id)
+        await q.answer("Blocklist cleared ✅")
+        await show(0)
+    else:
+        await q.answer()
+
+
 # ---------- /found, /status, /stats ----------
 
 @gated("found")
@@ -1258,11 +1671,29 @@ async def autocheck_job(context: ContextTypes.DEFAULT_TYPE):
     if state["busy"]:
         stats.add(chat_id, skipped=1)          # previous check still running - never overlap
         return
-    if _check_ready(state):
+    words = links = None
+    if state["source"] == "mena":              # the last check was /checkmena -> repeat it (fresh lists every cycle)
+        try:
+            words, links, _src = await _load_mena_lists()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Auto-check could not load the MENA lists: %s", e)
+            if not state["mena_warned"]:
+                state["mena_warned"] = True
+                try:
+                    await context.bot.send_message(chat_id=chat_id, parse_mode=HTML, text=ui.warn(
+                        "Auto-check could not load the lists", f"<code>{ui.e(str(e)[:200])}</code>",
+                        "<i>It will try again next cycle.</i>"))
+                except Exception:
+                    pass
+            return
+        state["mena_warned"] = False
+    if _check_ready(state, words, links):
         return
     state["busy"] = True
     state["pending_cancel"] = False
-    await run_check_session(context.bot, chat_id, "auto", None)
+    await run_check_session(context.bot, chat_id, "auto", None, words, links)
 
 
 async def heartbeat_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1302,7 +1733,16 @@ async def autocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not (MIN_AUTOCHECK_MINUTES <= minutes <= MAX_AUTOCHECK_MINUTES):
         await say(msg, ui.warn("Out of range", f"Please choose between <b>{MIN_AUTOCHECK_MINUTES}</b> and <b>{MAX_AUTOCHECK_MINUTES}</b> minutes."))
         return
-    problem = _check_ready(state)
+    words = links = None
+    if state["source"] == "mena":
+        try:
+            words, links, _src = await _load_mena_lists()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            await say(msg, ui.warn("Could not load the MENA lists", f"<code>{ui.e(str(e)[:200])}</code>"))
+            return
+    problem = _check_ready(state, words, links)
     if problem:
         await say(msg, problem)
         return
@@ -1310,7 +1750,10 @@ async def autocheck_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state["interval_minutes"] = minutes
     save_settings(chat_id)
     schedule_autocheck(context.job_queue, chat_id, minutes)
-    await say(msg, ui.autocheck_on_card(minutes, state["notify_mode"]))
+    card = ui.autocheck_on_card(minutes, state["notify_mode"])
+    if state["source"] == "mena":
+        card += "\n\n📡 Repeating the <b>/checkmena</b> check (the lists are re-loaded every cycle)"
+    await say(msg, card)
 
 
 @gated("autocheck")
@@ -1359,28 +1802,108 @@ async def document_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = get_state(chat.id)
     filename = "wordlist.txt" if kind == "words" else "linklist.txt"
     dest = chat_dir(chat.id) / filename
+    working = None
+    if doc.file_size and doc.file_size > 1_000_000:          # big file: show that something is happening
+        try:
+            working = await say(msg, ui.notice(
+                "⏳", "READING YOUR FILE", f"📥 <code>{ui.e(filename)}</code> · <b>{ui.e(ui.fmt_size(doc.file_size))}</b>",
+                "<i>Big files take a few seconds — please wait…</i>"))
+        except Exception:
+            working = None
+
+    async def reply(card: str, markup=None):
+        if working is not None and await edit_card(working, card, markup):
+            return
+        await say(msg, card, markup)
+
     try:
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(custom_path=dest)
         items, skipped = await asyncio.to_thread(checker.read_lines, dest)
     except Exception:
         logger.exception("Could not read uploaded file")
-        await say(msg, ui.warn("Upload failed", "I couldn't download or read that file.", "<i>Please try sending it again.</i>"))
+        await reply(ui.warn("Upload failed", "I couldn't download or read that file.", "<i>Please try sending it again.</i>"))
         return
 
     state[kind] = items
     label = "word(s)" if kind == "words" else "link(s)"
     lines = [f"📥 Loaded <b>{len(items):,}</b> {label} from <code>{filename}</code>"]
+    if doc.file_size:
+        lines[0] += f" · {ui.e(ui.fmt_size(doc.file_size))}"
     if skipped:
         lines.append(f"<i>{skipped:,} blank/duplicate line(s) skipped</i>")
     if kind == "links" and items and not any(checker.PLACEHOLDER_RE.search(x) for x in items):
         lines.append("⚠️ None of your links contain <code>(Word)</code> — each link will just be checked once.")
+    markup = None
     if state["words"] and state["links"]:
         total = checker.count_combinations(state["links"], state["words"])
         lines += ["", f"🔗 <code>{len(state['links']):,}</code> links × 📝 <code>{len(state['words']):,}</code> words = <b>{total:,}</b> combinations"]
-        lines.append(f"⚠️ <i>That is more than the limit of {MAX_COMBINATIONS:,} per run.</i>" if total > MAX_COMBINATIONS
-                     else "<i>Ready — send /check 🚀</i>")
-    await say(msg, ui.notice("✅", "FILE LOADED", *lines))
+        if total > MAX_COMBINATIONS:
+            lines.append(f"⚠️ <i>That is more than the limit of {MAX_COMBINATIONS:,} per run.</i>")
+        else:
+            eta = ui.eta_text(total, state.get("last_speed"))
+            if eta:
+                lines.append(eta)
+            lines.append("<i>Ready — press the button or send /check 🚀</i>")
+            markup = kb([[("🚀 Start check", "act:check")]])
+    await reply(ui.notice("✅", "FILE LOADED", *lines), markup)
+
+
+async def act_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Quick-action buttons (Start check / Check again / Found links) run the normal, permission-checked command."""
+    q = update.callback_query
+    action = q.data.split(":", 1)[1] if q.data and ":" in q.data else ""
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    fn = {"check": check_cmd, "mena": checkmena_cmd, "found": found_cmd}.get(action)
+    if fn is not None:
+        await fn(update, context)
+
+
+@admin_only(private_only=True)
+async def emoji_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/emoji - status · on | off | reset | remove ✅ 🔗"""
+    msg = update.effective_message
+    args = context.args or []
+    arg = args[0].lower() if args else ""
+    mapping = dict(ui.PREMIUM["map"])
+    on = ui.PREMIUM["on"]
+    if arg in ("on", "off"):
+        on = arg == "on" and PREMIUM_ENABLED
+    elif arg == "reset":
+        mapping = {}
+    elif arg == "remove" and len(args) > 1:
+        for tok in args[1:]:
+            for key in list(mapping):
+                if key in ui._base_emoji(tok):
+                    mapping.pop(key, None)
+    ui.set_premium(mapping, on)
+    save_premium()
+    await say(msg, ui.premium_card(ui.PREMIUM["on"], ui.PREMIUM["map"]))
+
+
+async def emoji_learn(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The admin sends a message that contains Telegram-Premium emoji -> the bot learns them."""
+    chat, user, msg = update.effective_chat, update.effective_user, update.effective_message
+    if chat is None or user is None or msg is None:
+        return
+    found: dict[str, str] = {}
+    if store.is_admin(user.id):
+        for ent in msg.entities or ():
+            if ent.type == "custom_emoji" and ent.custom_emoji_id:
+                base = ui._base_emoji(msg.parse_entity(ent))
+                if base:
+                    found[base] = ent.custom_emoji_id
+    if not found:
+        await private_text(update, context)           # not the admin / nothing usable: normal behaviour
+        return
+    mapping = dict(ui.PREMIUM["map"])
+    mapping.update(found)
+    ui.set_premium(mapping, PREMIUM_ENABLED)
+    save_premium()
+    await say(msg, ui.premium_card(ui.PREMIUM["on"], ui.PREMIUM["map"], list(found)))
 
 
 async def private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1751,13 +2274,14 @@ async def daily_reset_job(context: ContextTypes.DEFAULT_TYPE):
 
 BASE_COMMANDS = [
     ("start", "Welcome & setup"), ("help", "All your commands"), ("check", "Check all links with all words"),
+    ("checkmena", "Check the MENA lists from GitHub"), ("blocklist", "Manage blocked links"),
     ("cancel", "Cancel the running check"), ("addword", "Add words & check only those"), ("test", "Inspect one link"),
     ("found", "Links found so far"), ("autocheck", "Re-check automatically"), ("status", "Live status"),
     ("stats", "Today's statistics"), ("country", "Change country / time zone"), ("id", "Show IDs"),
 ]
 ADMIN_COMMANDS = [("users", "Users & permissions"), ("user", "Open a user's panel"), ("grant", "Give access"),
                   ("revoke", "Remove access"), ("broadcast", "Message every user"), ("allow", "Allow a group"),
-                  ("allowed", "List allowed groups")]
+                  ("allowed", "List allowed groups"), ("emoji", "Premium emoji for the bot")]
 
 
 async def post_init(app: Application):
@@ -1872,6 +2396,10 @@ def main():
         logger.warning("No admin configured! Put your own Telegram user ID in ALLOWED_CHAT_IDS (or ADMIN_IDS) "
                        "- without an admin nobody can be approved.")
 
+    load_premium()
+    install_premium_emoji()
+    logger.info("Premium emoji: %s, %d learned", "on" if ui.PREMIUM["on"] else "off", len(ui.PREMIUM["map"]))
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -1884,12 +2412,12 @@ def main():
 
     for name, fn in [
         ("start", start_cmd), ("help", help_cmd), ("id", id_cmd), ("country", country_cmd),
-        ("check", check_cmd), (["cancel", "cancle"], cancel_cmd), ("addword", addword_cmd), ("test", test_cmd),
+        ("check", check_cmd), ("checkmena", checkmena_cmd), ("blocklist", blocklist_cmd), (["cancel", "cancle"], cancel_cmd), ("addword", addword_cmd), ("test", test_cmd),
         ("found", found_cmd), ("status", status_cmd), ("stats", stats_cmd),
         ("autocheck", autocheck_cmd), ("stopautocheck", stopautocheck_cmd), ("notify", notify_cmd),
         ("users", users_cmd), ("user", user_cmd), ("grant", grant_cmd), ("revoke", revoke_cmd),
         ("broadcast", broadcast_cmd), ("allow", allow_cmd), ("disallow", disallow_cmd), ("allowed", allowed_cmd),
-        ("resetstats", resetstats_cmd),
+        ("resetstats", resetstats_cmd), ("emoji", emoji_cmd),
     ]:
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(country_cb, pattern=r"^cty:"))
@@ -1897,7 +2425,10 @@ def main():
     app.add_handler(CallbackQueryHandler(users_cb, pattern=r"^usr:"))
     app.add_handler(CallbackQueryHandler(broadcast_cb, pattern=r"^bc:"))
     app.add_handler(CallbackQueryHandler(test_cb, pattern=r"^tst:"))
+    app.add_handler(CallbackQueryHandler(blk_cb, pattern=r"^blk:"))
+    app.add_handler(CallbackQueryHandler(act_cb, pattern=r"^act:"))
     app.add_handler(MessageHandler(filters.Document.ALL, document_handler))
+    app.add_handler(MessageHandler(filters.Entity("custom_emoji") & filters.ChatType.PRIVATE, emoji_learn))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, private_text))
     app.add_error_handler(on_error)
 

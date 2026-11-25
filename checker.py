@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import itertools
 import json
 import os
@@ -69,6 +70,11 @@ RANGE_HEADERS = {"Range": "bytes=0-0"}
 
 RETRY_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524})
 RANGE_UNSUPPORTED = frozenset({400, 405, 416, 501})
+# "Not found" is normally 404 (or whatever the server answers for a made-up link - learned at the start).
+# These answers are NOT a normal "not found": a WAF / CDN / rate limiter is blocking us, so retry, never skip.
+SUSPECT_STATUSES = frozenset({401, 403, 407, 418, 451})
+HARD_STATUSES = frozenset({403, 429, 503})      # slow down immediately
+MAX_TRIPS = 8                                    # cool-down rounds in a row before giving up on a server
 
 # check outcomes
 NO, OK, RETRY, RANGE_BAD = 0, 1, 2, 3
@@ -106,25 +112,30 @@ def read_lines(path) -> tuple[list[str], int]:
 
     Returns (clean_unique_lines, number_of_lines_skipped).
     Handles UTF-8 BOM, Windows/Mac/Linux line endings, blank lines and
-    duplicates (order is preserved). A BOM at the start of a file used
-    to silently corrupt the FIRST word - that is handled here.
+    duplicates (order is preserved). The file is read line by line, so even a
+    multi-million-word list needs little more memory than the words themselves.
     """
     p = Path(path)
     if not p.exists():
         return [], 0
-    raw = p.read_bytes()
-    try:
-        text = raw.decode("utf-8-sig")
-    except UnicodeDecodeError:
-        text = raw.decode("latin-1")
-    cleaned = []
-    for line in text.splitlines():
-        line = line.replace("\ufeff", "").replace("\u200b", "").strip()
-        if line:
-            cleaned.append(line)
-    unique = list(dict.fromkeys(cleaned))
-    skipped = len(text.splitlines()) - len(unique)
-    return unique, skipped
+    for enc in ("utf-8-sig", "latin-1"):
+        seen: set[str] = set()
+        out: list[str] = []
+        total = 0
+        try:
+            with open(p, encoding=enc, newline=None) as f:
+                for line in f:
+                    total += 1
+                    if "\ufeff" in line or "\u200b" in line:
+                        line = line.replace("\ufeff", "").replace("\u200b", "")
+                    line = line.strip()
+                    if line and line not in seen:
+                        seen.add(line)
+                        out.append(line)
+        except UnicodeDecodeError:
+            continue
+        return out, total - len(out)
+    return [], 0
 
 
 def quote_word(word: str) -> str:
@@ -152,6 +163,43 @@ def iter_urls(links: list[str], words: list[str]):
             yield link
 
 
+def iter_urls_shard(links: list[str], words: list[str], idx: int, nprocs: int):
+    """Exactly every nprocs-th combination of iter_urls(), starting at idx - but the skipped
+    ones are never even built, so many workers cost no extra CPU."""
+    qwords = [quote_word(w) for w in words]
+    n_words = len(qwords)
+    pos = 0                                     # global number of the next combination
+    for link in links:
+        if PLACEHOLDER_RE.search(link):
+            parts = PLACEHOLDER_RE.split(link)
+            for qw in qwords[(idx - pos) % nprocs::nprocs]:
+                yield qw.join(parts)
+            pos += n_words
+        else:
+            if pos % nprocs == idx:
+                yield link
+            pos += 1
+
+
+def iter_urls_shard_file(links: list[str], words_path, n_words: int, idx: int, nprocs: int):
+    """Same combinations as iter_urls_shard(), but the words are STREAMED from a file (one clean word per
+    line), never loaded into memory - so a 3-million-word list costs a worker almost no RAM."""
+    pos = 0
+    for link in links:
+        if PLACEHOLDER_RE.search(link):
+            parts = PLACEHOLDER_RE.split(link)
+            start = (idx - pos) % nprocs
+            if start < n_words:
+                with open(words_path, encoding="utf-8", newline="\n") as f:
+                    for line in itertools.islice(f, start, None, nprocs):
+                        yield quote_word(line.rstrip("\n")).join(parts)
+            pos += n_words
+        else:
+            if pos % nprocs == idx:
+                yield link
+            pos += 1
+
+
 # ============================================================
 # WORKER SIDE (runs inside "python checker.py --worker")
 # ============================================================
@@ -160,22 +208,32 @@ REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 DRAIN_LIMIT = 65536
 
 
-def _congestion(st):
-    """The server pushed back (429 / 5xx / timeouts): use fewer simultaneous connections."""
-    now = time.monotonic()
-    if now - st.last_cut >= 0.3:
-        st.last_cut = now
-        st.limit = max(st.min_limit, int(st.limit * 0.7))
-        st.successes = 0
+def _window(st, now: float):
+    """Every 200 answers: too many problems -> fewer connections, almost none -> more again.
+    (One timeout among thousands of answers is normal and must NOT slow the check down.)"""
+    if st.win_n < 200:
+        return
+    ratio = st.win_bad / st.win_n
+    st.win_n = st.win_bad = 0
+    if ratio > 0.25:
+        if now - st.last_cut >= 0.3:
+            st.last_cut = now
+            st.limit = max(st.min_limit, int(st.limit * 0.7))
+    elif ratio < 0.08 and st.limit < st.max_limit:
+        st.limit = min(st.max_limit, st.limit + max(2, st.max_limit // 20))
+
+
+def _congestion(st, hard: bool = False):
+    """A problem answer (timeout / 5xx / 429 / block). hard = counts triple (rate limit or block)."""
+    st.win_n += 1
+    st.win_bad += 3 if hard else 1         # a 429 / block counts triple, but one stray answer never throttles everything
+    _window(st, time.monotonic())
 
 
 def _success(st):
-    """Clean answers: slowly allow more simultaneous connections again."""
-    st.successes += 1
-    if st.successes >= 100:
-        st.successes = 0
-        if st.limit < st.max_limit:
-            st.limit = min(st.max_limit, st.limit + max(2, st.max_limit // 40))
+    """A clean answer."""
+    st.win_n += 1
+    _window(st, time.monotonic())
 
 
 def image_size(buf: bytes) -> tuple[int, int] | None:
@@ -279,6 +337,8 @@ async def _get(session, url: str, headers, st):
             outcome = RETRY
         elif headers is not None and status in RANGE_UNSUPPORTED:
             outcome = RANGE_BAD
+        elif status in SUSPECT_STATUSES and st.base_statuses and status not in st.base_statuses:
+            outcome = RETRY      # e.g. 403 while made-up links get 404 -> we are being blocked, not "not found"
         else:
             outcome = NO
         await _drain(resp, clen_n)
@@ -293,7 +353,7 @@ async def _probe(session, url: str, st) -> int:
             if outcome == RANGE_BAD:
                 outcome = NO
         if outcome == RETRY:
-            _congestion(st)
+            _congestion(st, hard=status in HARD_STATUSES)
         else:
             _success(st)
         return outcome
@@ -357,10 +417,13 @@ async def _verify(session, url: str, st):
     info = await _fetch_head(session, url)
     status = info["status"]
     if status in RETRY_STATUSES:
-        _congestion(st)
+        _congestion(st, hard=status in HARD_STATUSES)
         return RETRY, None
     if status not in (200, 206):
-        return NO, None
+        if status in (404, 410) or status in st.base_statuses:
+            return NO, None
+        _congestion(st, hard=status in HARD_STATUSES)
+        return RETRY, None       # looked real a moment ago, now blocked/odd -> try again, never skip
     if info["ctype"].startswith("text/html"):
         return NO, None
     kind = None
@@ -381,6 +444,7 @@ async def _learn_baseline(session, links: list[str], st):
     if not templates:
         return
     sem = asyncio.Semaphore(20)
+    counts: dict[int, int] = {}     # what the server answered for made-up links, per status
 
     async def one(tmpl: str, junk: str):
         url = junk.join(PLACEHOLDER_RE.split(tmpl))
@@ -396,6 +460,7 @@ async def _learn_baseline(session, links: list[str], st):
                     if status in RETRY_STATUSES:
                         await asyncio.sleep(0.5)
                         continue
+                    counts[status] = counts.get(status, 0) + 1
                     if status in REDIRECT_STATUSES:
                         st.soft404 = True
                         if loc:
@@ -415,11 +480,15 @@ async def _learn_baseline(session, links: list[str], st):
                 except Exception:
                     await asyncio.sleep(0.3 * (attempt + 1))
 
-    junks = ["zqx" + os.urandom(4).hex() + "k", "qwv" + os.urandom(4).hex() + "m"]
+    junks = ["zqx" + os.urandom(4).hex() + "k", "qwv" + os.urandom(4).hex() + "m",
+             "jxk" + os.urandom(4).hex() + "p", "vzr" + os.urandom(4).hex() + "t"]
     try:
-        await asyncio.wait_for(asyncio.gather(*(one(t, j) for t in templates for j in junks)), 30)
+        await asyncio.wait_for(asyncio.gather(*(one(t, j) for t in templates for j in junks)), 20)
     except asyncio.TimeoutError:
         pass  # never let this hold up the real check
+    # a status is the server's NORMAL "not found" only if it is common (a stray block must not count)
+    total = sum(counts.values())
+    st.base_statuses = {c for c, k in counts.items() if k * 3 >= total}
 
 
 async def _check(session, url: str, attempts: int, base_delay: float, st, honor_abort: bool = True):
@@ -440,12 +509,19 @@ async def _check(session, url: str, attempts: int, base_delay: float, st, honor_
             outcome = RETRY
         if outcome != RETRY:
             st.consec = 0
+            st.trips = 0
             return outcome, meta
         st.consec += 1
         st.errors += 1
         if honor_abort and st.consec >= st.abort_after:
-            st.abort = True
-            return RETRY, None
+            # The server / network is having a bad moment: everybody rests, then we go on.
+            # Only a long, unbroken outage (MAX_TRIPS cool-downs in a row) ends the run.
+            st.trips += 1
+            st.consec = 0
+            if st.trips >= MAX_TRIPS:
+                st.abort = True
+                return RETRY, None
+            st.pause_until = time.monotonic() + min(20.0, 2.0 * st.trips)
         if attempt + 1 < attempts:
             await asyncio.sleep(base_delay * (2 ** attempt) * (0.5 + random.random()))
     return RETRY, None
@@ -490,14 +566,20 @@ async def _shard(cfg: dict):
     out = _Out()
     st = SimpleNamespace(
         processed=0, errors=0, consec=0, abort=False, exhausted=False,
-        abort_after=cfg["abort_after"], phase="main", pending_retry=0,
-        baseline=set(), base_sigs=set(), base_redirects=set(), soft404=False,
+        abort_after=cfg["abort_after"], phase="prepare", pending_retry=0,
+        baseline=set(), base_sigs=set(), base_redirects=set(), base_statuses=set(), soft404=False,
+        win_n=0, win_bad=0, trips=0, pause_until=0.0,
         # adaptive speed: how many connections the server currently tolerates
-        limit=conc, max_limit=conc, min_limit=max(5, conc // 20), last_cut=0.0, successes=0,
+        limit=conc, max_limit=conc, min_limit=max(10, conc // 10), last_cut=0.0, successes=0, inflight=0,
     )
     # This worker's share: every nprocs-th URL, starting at idx.
-    urls = itertools.islice(iter_urls(cfg["links"], cfg["words"]), idx, None, nprocs)
+    if cfg.get("words_file"):
+        urls = iter_urls_shard_file(cfg["links"], cfg["words_file"], cfg["n_words"], idx, nprocs)
+    else:
+        urls = iter_urls_shard(cfg["links"], cfg["words"], idx, nprocs)
     deferred: list[str] = []
+    retryq: list = []            # heap of (due_time, seq, url, tries): quick re-tries that never block a connection slot
+    seq = itertools.count()
 
     loop = asyncio.get_running_loop()
     cancel_ev = asyncio.Event()
@@ -513,24 +595,48 @@ async def _shard(cfg: dict):
         cookie_jar=aiohttp.DummyCookieJar(), auto_decompress=False,
     ) as session:
 
-        await _learn_baseline(session, cfg["links"], st)
-
         async def first_pass_worker(wid: int):
-            while not st.abort and not st.exhausted:
+            while not st.abort:
+                if st.exhausted and not retryq and st.inflight == 0:
+                    return
                 if wid >= st.limit:          # the server is pushing back: this worker rests for now
                     await asyncio.sleep(0.2)
                     continue
+                wait = st.pause_until - time.monotonic()
+                if wait > 0:                 # cool-down after a long run of errors
+                    await asyncio.sleep(min(wait, 1.0))
+                    continue
+                now = time.monotonic()
+                tries = 0
+                if retryq and retryq[0][0] <= now:
+                    _, _, url, tries = heapq.heappop(retryq)
+                else:
+                    try:
+                        url = next(urls)
+                    except StopIteration:
+                        st.exhausted = True
+                        # nothing fresh left: wait for retries that are not due yet (or for workers still busy)
+                        await asyncio.sleep(min(0.25, max(0.02, retryq[0][0] - now)) if retryq else 0.02)
+                        continue
+                st.inflight += 1
                 try:
-                    url = next(urls)
-                except StopIteration:
-                    st.exhausted = True
-                    return
-                r, meta = await _check(session, url, attempts, 0.25, st)
-                st.processed += 1
+                    r, meta = await _check(session, url, 1, 0.0, st)
+                finally:
+                    st.inflight -= 1
                 if r == OK:
+                    st.processed += 1
                     out.emit({"t": "f", "u": url, "m": meta})
                 elif r == RETRY:
-                    deferred.append(url)
+                    tries += 1
+                    if tries < attempts and not st.abort:
+                        # try again soon, but let the connection serve other links meanwhile
+                        due = time.monotonic() + 0.25 * (2 ** (tries - 1)) * (0.5 + random.random())
+                        heapq.heappush(retryq, (due, next(seq), url, tries))
+                    else:
+                        st.processed += 1
+                        deferred.append(url)
+                else:
+                    st.processed += 1
 
         async def retry_round(items: list[str], conc2: int, attempts2: int) -> list[str]:
             it = iter(items)
@@ -553,6 +659,8 @@ async def _shard(cfg: dict):
             return still
 
         async def run_all():
+            await _learn_baseline(session, cfg["links"], st)       # (progress is already reported: phase "prepare")
+            st.phase = "main"
             await asyncio.gather(*(first_pass_worker(i) for i in range(conc)))
             if st.abort:
                 return
@@ -570,7 +678,7 @@ async def _shard(cfg: dict):
 
         async def reporter():
             while True:
-                pending = len(deferred) if st.phase == "main" else st.pending_retry
+                pending = (len(deferred) + len(retryq)) if st.phase == "main" else st.pending_retry
                 out.emit({"t": "p", "i": idx, "n": st.processed, "r": pending, "e": st.errors, "ph": st.phase, "l": st.limit})
                 out.flush()
                 await asyncio.sleep(0.25)
@@ -591,7 +699,7 @@ async def _shard(cfg: dict):
         rep.cancel()
         await asyncio.gather(rep, cancel_task, return_exceptions=True)
 
-    unverified = list(deferred)
+    unverified = list(deferred) + [item[2] for item in retryq]
     if st.abort:
         unverified.extend(urls)  # everything not even attempted
 
@@ -658,10 +766,10 @@ class CheckRun:
         workdir: str | Path,
         processes: int | None = None,
         concurrency: int = 600,
-        connect_timeout: float = 8.0,
-        total_timeout: float = 15.0,
+        connect_timeout: float = 6.0,
+        total_timeout: float = 12.0,
         attempts: int = 3,
-        final_rounds: int = 3,
+        final_rounds: int = 4,
         abort_after: int = 1500,
         small_run: int = 5000,
     ):
@@ -731,13 +839,30 @@ class CheckRun:
         remaining = max(0, self.total - processed)
         eta = remaining / speed if speed > 0 and remaining > 0 else None
         in_retry = processed >= self.total and retrying > 0
+        phases = [sh.get("ph") for sh in self.shards.values()]
+        if not self.shards or any(ph is None for ph in phases):
+            stage = "starting"           # worker processes are still booting
+        elif any(ph == "prepare" for ph in phases):
+            stage = "preparing"          # learning how the server answers made-up links
+        elif in_retry:
+            stage = "retry"
+        else:
+            stage = "checking"
         return {
+            "stage": stage,
             "total": self.total, "processed": processed, "found": len(self.found),
             "retrying": retrying, "errors": errors, "speed": speed, "eta": eta,
             "elapsed": self.elapsed(), "in_retry": in_retry, "processes": self.nprocs,
             "conns": sum(sh.get("l") or 0 for sh in self.shards.values()),
             "conns_max": self.per_conc * self.nprocs,
         }
+
+    def _write_words(self, dest: Path):
+        with open(dest, "w", encoding="utf-8", newline="\n") as f:
+            step = 100_000
+            for k in range(0, len(self.words), step):
+                f.write("\n".join(self.words[k:k + step]))
+                f.write("\n")
 
     # ---------- control ----------
     def cancel(self):
@@ -777,10 +902,13 @@ class CheckRun:
             self.nprocs = 1 if self.total < self.small_run else max(1, min(self.processes, self.total))
             per_conc = max(10, self.concurrency // self.nprocs)
             self.workdir.mkdir(parents=True, exist_ok=True)
+            words_file = self.workdir / "words.txt"
+            await asyncio.to_thread(self._write_words, words_file)      # big lists never go through the pipe
 
             for i in range(self.nprocs):
                 cfg = dict(self.opts, idx=i, nprocs=self.nprocs, concurrency=per_conc,
-                           links=self.links, words=self.words, outdir=str(self.workdir))
+                           links=self.links, words_file=str(words_file), n_words=len(self.words),
+                           outdir=str(self.workdir))
                 proc = await asyncio.create_subprocess_exec(
                     sys.executable, str(CHECKER_PATH), "--worker",
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -857,6 +985,7 @@ class CheckRun:
                     pass
         elif t == "p":
             sh["n"], sh["r"], sh["e"] = msg["n"], msg["r"], msg.get("e", 0)
+            sh["ph"] = msg.get("ph")
             sh["l"] = msg.get("l", sh.get("l"))
         elif t == "d":
             sh.update(n=msg["n"], r=0, e=msg.get("e", 0), done=True)

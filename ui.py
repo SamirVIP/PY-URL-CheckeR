@@ -10,13 +10,99 @@ returned as plain lists of (label, callback_data).
 from __future__ import annotations
 
 import http
+import re
 from datetime import datetime, timezone
 from html import escape
 
 import countries as C
 from access import PERMISSIONS
 
-DIV = "▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬▬"
+DIV = "━━━━━━━━━━━━━━━━━━"
+
+
+# ---------------- premium (custom) emoji ----------------
+# The admin teaches the bot which Telegram-Premium emoji to use (see /emoji in bot.py): every normal emoji the
+# bot sends that has a premium twin is swapped for it at send time. Nothing else in the code has to change.
+
+PREMIUM: dict = {"on": True, "map": {}}        # base emoji (no U+FE0F) -> custom emoji id
+MAX_PREMIUM_PER_MESSAGE = 90                    # Telegram allows 100 custom emoji per message
+_PREMIUM_RE = None
+_TAG_RE = re.compile(r"(<[^>]*>)")
+
+# the emoji this bot uses most - a premium version of any of them can be learned with /emoji
+UI_EMOJIS = ["✅", "⚠️", "🔗", "⏳", "🚫", "⛔", "🔁", "🕒", "📡", "👤", "⏱", "📝", "📢", "👑", "🔬", "📚", "🛑",
+             "❌", "👥", "🌍", "🔒", "🔔", "⚡", "➕", "📦", "📅", "🚀", "🧹", "🔎", "🔐", "✨", "📂", "📊", "🎉",
+             "🆕", "📎", "📥", "🧪", "🌙", "🤔", "🎛", "👋"]
+
+
+def _base_emoji(ch: str) -> str:
+    return ch.replace("\ufe0f", "").strip()
+
+
+def set_premium(mapping: dict, on: bool = True):
+    global _PREMIUM_RE
+    clean = {}
+    for k, v in (mapping or {}).items():
+        k = _base_emoji(str(k))
+        if k and str(v).isdigit():
+            clean[k] = str(v)
+    PREMIUM["map"] = clean
+    PREMIUM["on"] = bool(on)
+    keys = sorted(clean, key=len, reverse=True)
+    _PREMIUM_RE = re.compile("(" + "|".join(re.escape(k) for k in keys) + ")\ufe0f?") if keys else None
+
+
+def premiumize(text: str) -> str:
+    """Swap known emoji for their premium twins. Never touches <code>/<pre>/<a> content (Telegram forbids
+    custom emoji there) and stops at 90 per message."""
+    if not text or not PREMIUM["on"] or _PREMIUM_RE is None or "<tg-emoji" in text:
+        return text
+    parts = _TAG_RE.split(text)
+    depth = 0
+    used = 0
+    for k, part in enumerate(parts):
+        if k % 2 == 1:                                   # an HTML tag
+            low = part.lower()
+            if low.startswith(("<code", "<pre", "<a ")):
+                depth += 1
+            elif low.startswith(("</code", "</pre", "</a")):
+                depth = max(0, depth - 1)
+            continue
+        if depth or not part:
+            continue
+
+        def swap(m):
+            nonlocal used
+            if used >= MAX_PREMIUM_PER_MESSAGE:
+                return m.group(0)
+            used += 1
+            return f'<tg-emoji emoji-id="{PREMIUM["map"][m.group(1)]}">{m.group(0)}</tg-emoji>'
+        parts[k] = _PREMIUM_RE.sub(swap, part)
+    return "".join(parts)
+
+
+def premium_card(on: bool, mapping: dict, learned: list[str] | None = None) -> str:
+    rows = [("Status", "<b>ON ✅</b>" if on else "<b>OFF ⛔</b>"),
+            ("Premium emoji known", f"<b>{len(mapping)}</b>")]
+    lines = [head("✨", "PREMIUM EMOJI"), tree(rows)]
+    if learned:
+        lines += ["", "<b>Just learned:</b> " + " ".join(e(x) for x in learned)]
+    if mapping:
+        lines += ["", "<b>Active:</b> " + " ".join(e(x) for x in mapping)]
+    unused = [x for x in UI_EMOJIS if _base_emoji(x) not in mapping]
+    lines += [
+        "",
+        "<b>How it works</b>",
+        "Send me <b>one message</b> that contains your <b>premium emoji</b>, placed instead of the normal ones "
+        "below. I learn them and every matching emoji in my messages turns premium.",
+        "",
+        "<b>Emoji I use</b> (replace any of them):",
+        " ".join(e(x) for x in unused) if unused else "<i>all of them are premium already 🎉</i>",
+        "",
+        "<code>/emoji off</code> · <code>/emoji on</code> · <code>/emoji remove ✅</code> · <code>/emoji reset</code>",
+        "<i>The bot owner needs Telegram Premium for this to show.</i>",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------- small helpers ----------------
@@ -85,7 +171,14 @@ def fmt_size(num) -> str | None:
 
 def bar(pct: float, width: int = 20) -> str:
     filled = max(0, min(width, int(pct // (100 / width))))
-    return "█" * filled + "░" * (width - filled)
+    return "▰" * filled + "▱" * (width - filled)
+
+
+def eta_text(total: int, speed) -> str | None:
+    """'~12m 30s' estimate from the speed of the last check (None when unknown)."""
+    if not speed or speed <= 0 or not total:
+        return None
+    return f"⏱ Estimated time: <b>~{fmt_dur(total / speed)}</b> <i>(based on your last check)</i>"
 
 
 def notice(icon: str, title: str, *lines: str) -> str:
@@ -186,7 +279,9 @@ def access_changed_card(rec: dict, ctx_text: str, access: str) -> str:
 # ---------------- welcome / help ----------------
 
 CMD_DOCS: dict[str, list[tuple[str, str]]] = {
-    "check": [("/check", "Check every link with every word"), ("/cancel", "Stop a running check")],
+    "check": [("/check", "Check every link with every word"),
+              ("/checkmena", "Check the GitHub wordlist + linklist (/autocheck repeats it)"),
+              ("/cancel", "Stop a running check")],
     "addword": [("/addword Word1 Word2", "Add words & check only those")],
     "test": [("/test LINK", "Inspect one link in detail")],
     "found": [("/found", "Every working link found so far")],
@@ -203,6 +298,7 @@ ADMIN_DOCS = [
     ("/broadcast TEXT", "Message every user (preview first)"),
     ("/allow · /disallow · /allowed", "Manage allowed groups"),
     ("/resetstats", "Reset today's statistics for this chat"),
+    ("/emoji", "Teach the bot your Telegram-Premium emoji"),
 ]
 
 
@@ -241,6 +337,11 @@ def help_card(keys: list[str], admin: bool, limit: int, uploads: bool) -> str:
             "• <code>linklist.txt</code> — one link per line, e.g.",
             "<code>https://example.com/img_(Word)_en.jpg</code>",
             "<i>Send a file again to replace it · max 20 MB each.</i>",
+            "",
+            "<b>🚫 Blocklist</b>",
+            "• Press <b>🚫 Put in blocklist</b> under a found link — it is never sent again",
+            "• <code>/blocklist</code> — see blocked links and remove them",
+            "• <code>/blocklist all</code> — admin: block every link sent so far, only new ones are sent after",
         ]
     for key in PERMISSIONS:
         if key in keys:
@@ -265,8 +366,22 @@ def _key_icon(key: str) -> str:
 
 # ---------------- checking ----------------
 
+_STAGES = {
+    "starting": ("🚀", "STARTING WORKERS", "Booting the worker processes…"),
+    "preparing": ("🧪", "LEARNING THE SERVER", "Checking how the server answers made-up links — this keeps the results accurate…"),
+}
+
+
 def progress_card(s: dict, suspicious: bool, title: str = "Checking links…") -> str:
     total = s["total"] or 1
+    stage = s.get("stage", "checking")
+    if stage in _STAGES:
+        icon, ttl, sub = _STAGES[stage]
+        rows = [("📦 Combinations", code(n(s["total"]))),
+                ("🧵 Workers", code(n(s["processes"])) if s["processes"] else "<i>starting…</i>"),
+                ("⏱ Elapsed", code(fmt_dur(s["elapsed"])))]
+        return "\n".join([head(icon, ttl), f"<code>{bar(0)}</code> <b>0.0%</b>", "", tree(rows), "",
+                          f"<i>{e(sub)}</i>", "<i>Very big lists need a few seconds here · send /cancel to stop</i>"])
     pct = min(100.0, s["processed"] * 100.0 / total)
     rows = [
         ("📦 Checked", f"{code(n(s['processed']))} / {code(n(s['total']))}"),
@@ -281,7 +396,9 @@ def progress_card(s: dict, suspicious: bool, title: str = "Checking links…") -
         rows.append(("⏳ Time left", code("~" + fmt_dur(s["eta"]))))
     else:
         rows.append(("⏳ Time left", "<i>calculating…</i>"))
-    lines = [head("🔎", title), f"<code>{bar(pct)}</code> <b>{pct:.1f}%</b>", "", tree(rows)]
+    icon = "🔁" if stage == "retry" else "🔎"
+    lines = [head(icon, "Re-checking failed links…" if stage == "retry" else title),
+             f"<code>{bar(pct)}</code> <b>{pct:.1f}%</b>", "", tree(rows)]
     notes = []
     if s["conns_max"] and s["conns"] < 0.85 * s["conns_max"] and s["processed"] < s["total"]:
         notes.append(f"⚙️ Server is limiting speed — using {n(s['conns'])} of {n(s['conns_max'])} connections "
@@ -318,13 +435,20 @@ def summary_card(run, extra: list[str], tz: C.TzCtx) -> str:
         rows.append(("⚠️ Unverified", f"<b>{n(run.unverified_count)}</b>"))
     rows.append(("⏱ Time", f"{code(fmt_dur(el))}{avg}"))
     rows.append(("🕒 Finished", f"{code(tz.fmt(tz.now()))} · <i>{e(tz.label)}</i>"))
+    if run.cancelled or run.aborted:
+        banner = None
+    elif run.found:
+        banner = f"🎉 <b>{n(len(run.found))} working link(s) found!</b>"
+    else:
+        banner = "😴 <i>No working links this time.</i>"
     lines = [
         head(icon, title),
         f"🔗 <code>{n(len(run.links))}</code> links × 📝 <code>{n(len(run.words))}</code> words "
         f"= <b>{n(run.total)}</b> combinations",
-        "",
-        tree(rows),
     ]
+    if banner:
+        lines.append(banner)
+    lines += ["", tree(rows)]
     notes = []
     if run.unverified_count:
         notes.append("Some links could not be verified (network/server errors) — the list is attached.")
